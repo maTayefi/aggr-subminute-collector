@@ -1,0 +1,13 @@
+# HTTP
+httpx>=0.28
+
+# Data and Parquet
+pandas>=2.3
+pyarrow>=22
+numpy>=2.3
+
+# Remote private Dataset repository
+huggingface_hub>=0.34
+
+# Tests
+pytest>=8.4
