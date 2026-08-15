@@ -1,12 +1,26 @@
 # collector\market_policy.py
-"""Reviewed BTC/ETH aggr.trade derivative-market policies.
+"""Reviewed BTC/ETH derivative market policies for aggr.trade collection.
 
-The production request URLs supplied by the project owner contain both spot and
-derivative markets. The collector must not reuse those URLs unchanged.
+The original chart URLs mix spot and derivative instruments. This collector
+must never infer the production CVD universe only from suffixes or from every
+market returned by /products.
 
-Every included market below has an explicit tier and was reviewed against the
-supplied aggr-server catalog/exchange-adapter behavior. Version 1 does not
-dynamically add products merely because a new name appears in /products.
+Version 1 uses explicit allowlists proven to be accepted by the supplied
+historical GET requests and classified from the supplied aggr exchange/catalog
+implementations.
+
+Policy rules
+------------
+
+* Futures/perpetual derivatives only.
+* Spot markets are excluded.
+* Options are excluded and are not requested.
+* The exact Binance USDT perpetual is the only execution-price source.
+* All selected vbuy/vsell values are USD-like notionals because aggr-server
+  stores price multiplied by exchange-normalized base size.
+* Market tiers are diagnostic labels only. Total CVD sums every selected row.
+* A policy change requires a new policy version and therefore a new manifest
+  market-list identity.
 """
 
 from __future__ import annotations
@@ -16,13 +30,21 @@ import hashlib
 import json
 from typing import Iterable
 
-
+MARKET_POLICY_SCHEMA_VERSION = "smp_aggr_market_policy.v1"
+COLLECTOR_SCHEMA_VERSION = "smp_aggr_collector.v1"
 SOURCE_INTERVAL_MS = 5000
-COLLECTOR_SCHEMA_VERSION = "1"
+
+_ALLOWED_TIERS = {
+    "USDT",
+    "USDC",
+    "USD_INVERSE",
+}
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, order=True)
 class MarketSpec:
+    """One reviewed derivative instrument in a collection policy."""
+
     market: str
     tier: str
 
@@ -33,17 +55,17 @@ class MarketSpec:
         if not market or ":" not in market:
             raise ValueError(f"Invalid aggr market identifier: {self.market!r}")
 
-        if tier not in {"USDT", "USDC", "USD"}:
-            raise ValueError(
-                f"Unsupported market tier {self.tier!r} for {market!r}"
-            )
+        if tier not in _ALLOWED_TIERS:
+            raise ValueError(f"Unsupported market tier {tier!r} for {market!r}")
 
         object.__setattr__(self, "market", market)
         object.__setattr__(self, "tier", tier)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class MarketPolicy:
+    """Complete immutable market policy for one base asset."""
+
     base: str
     version: str
     price_market: str
@@ -55,28 +77,25 @@ class MarketPolicy:
         price_market = str(self.price_market or "").strip()
 
         if base not in {"BTC", "ETH"}:
-            raise ValueError(f"Unsupported policy base: {base!r}")
+            raise ValueError("Version 1 market policies support BTC and ETH only")
 
         if not version:
             raise ValueError("Market policy version must be non-empty")
 
         if not self.markets:
-            raise ValueError("Market policy requires at least one market")
+            raise ValueError("Market policy must contain at least one market")
 
-        names = [spec.market for spec in self.markets]
+        market_names = [item.market for item in self.markets]
 
-        if len(names) != len(set(names)):
+        if len(market_names) != len(set(market_names)):
             duplicates = sorted(
-                name for name in set(names) if names.count(name) > 1
+                {name for name in market_names if market_names.count(name) > 1}
             )
-            raise ValueError(
-                f"Market policy contains duplicate markets: {duplicates}"
-            )
+            raise ValueError(f"Market policy contains duplicate names: {duplicates}")
 
-        if price_market not in names:
+        if price_market not in set(market_names):
             raise ValueError(
-                "The exact Binance USDT perpetual price market must also be "
-                "inside the selected CVD universe"
+                "price_market must be included in the reviewed market list"
             )
 
         object.__setattr__(self, "base", base)
@@ -85,180 +104,154 @@ class MarketPolicy:
 
     @property
     def selected_markets(self) -> tuple[str, ...]:
-        return tuple(spec.market for spec in self.markets)
+        """Return deterministic lexicographically sorted market names."""
+
+        return tuple(sorted(item.market for item in self.markets))
+
+    @property
+    def request_markets(self) -> tuple[str, ...]:
+        """Return deterministic markets used in the historical URL."""
+
+        return self.selected_markets
 
     @property
     def tier_by_market(self) -> dict[str, str]:
-        return {spec.market: spec.tier for spec in self.markets}
+        return {item.market: item.tier for item in self.markets}
 
     @property
     def market_list_hash(self) -> str:
+        """Hash every policy field which affects archive interpretation."""
+
         payload = {
+            "schema": MARKET_POLICY_SCHEMA_VERSION,
             "base": self.base,
             "version": self.version,
             "price_market": self.price_market,
             "markets": [
                 {
-                    "market": spec.market,
-                    "tier": spec.tier,
+                    "market": market,
+                    "tier": self.tier_by_market[market],
                 }
-                for spec in self.markets
+                for market in self.selected_markets
             ],
         }
 
         encoded = json.dumps(
             payload,
+            ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
-            ensure_ascii=True,
         ).encode("utf-8")
 
         return hashlib.sha256(encoded).hexdigest()
 
+    def assert_response_markets_allowed(
+        self,
+        response_markets: Iterable[str],
+    ) -> None:
+        observed = {
+            str(value or "").strip()
+            for value in response_markets
+            if str(value or "").strip()
+        }
 
-def _specs(
-    tier: str,
-    markets: Iterable[str],
-) -> tuple[MarketSpec, ...]:
-    return tuple(MarketSpec(market, tier) for market in markets)
+        unknown = sorted(observed - set(self.selected_markets))
+
+        if unknown:
+            raise ValueError(
+                "aggr response contains market(s) outside the reviewed "
+                f"{self.base} policy: {unknown[:20]}"
+            )
 
 
-BTC_POLICY = MarketPolicy(
-    base="BTC",
-    version="btc-v1",
-    price_market="BINANCE_FUTURES:btcusdt",
-    markets=(
-        *_specs(
-            "USDT",
-            (
-                "ASTER:BTCUSDT",
-                "BINANCE_FUTURES:btcusdt",
-                "BITFINEX:BTCF0:USTF0",
-                "BITGET:BTCUSDT",
-                "BITMART:BTCUSDT",
-                "BITMEX:XBTUSDT",
-                "BITMEX:XBT_USDT",
-                "BITUNIX:BTCUSDT",
-                "BYBIT:BTCUSDT",
-                "GATEIO:BTC_USDT",
-                "HUOBI:BTC-USDT",
-                "KUCOIN:XBTUSDTM",
-                "MEXC:BTC_USDT",
-                "OKEX:BTC-USDT-SWAP",
-                "PHEMEX:BTCUSDT",
-            ),
-        ),
-        *_specs(
-            "USDC",
-            (
-                "BINANCE_FUTURES:btcusdc",
-                "BITMART:BTCUSDC",
-                "DERIBIT:BTC_USDC-PERPETUAL",
-                "KUCOIN:XBTUSDCM",
-                "OKEX:BTC-USDC-SWAP",
-                "PHEMEX:BTCUSDC",
-            ),
-        ),
-        *_specs(
-            "USD",
-            (
-                "BINANCE_FUTURES:btcusd_perp",
-                "BITGET:BTCUSD",
-                "BITGET:BTCPERP",
-                "BITMART:BTCUSD",
-                "BITMEX:XBTUSD",
-                "BYBIT:BTCUSD",
-                "COINBASE:BTC-PERP-INTX",
-                "DERIBIT:BTC-PERPETUAL",
-                "DYDX:BTC-USD",
-                "GATEIO:BTC_USD",
-                "HUOBI:BTC-USD",
-                "HYPERLIQUID:BTC",
-                "KRAKEN:PF_XBTUSD",
-                "KRAKEN:PI_XBTUSD",
-                "KUCOIN:XBTUSDM",
-                "MEXC:BTC_USD",
-                "OKEX:BTC-USD-SWAP",
-                "PHEMEX:BTCUSD",
-            ),
-        ),
-    ),
+_BTC_MARKETS = (
+    # Linear USDT derivatives.
+    MarketSpec("BINANCE_FUTURES:btcusdt", "USDT"),
+    MarketSpec("BITFINEX:BTCF0:USTF0", "USDT"),
+    MarketSpec("BITGET:BTCUSDT", "USDT"),
+    MarketSpec("BITMEX:XBT_USDT", "USDT"),
+    MarketSpec("BITMEX:XBTUSDT", "USDT"),
+    MarketSpec("BITUNIX:BTCUSDT", "USDT"),
+    MarketSpec("BYBIT:BTCUSDT", "USDT"),
+    MarketSpec("GATEIO:BTC_USDT", "USDT"),
+    MarketSpec("HUOBI:BTC-USDT", "USDT"),
+    MarketSpec("KUCOIN:XBTUSDTM", "USDT"),
+    MarketSpec("MEXC:BTC_USDT", "USDT"),
+    MarketSpec("OKEX:BTC-USDT-SWAP", "USDT"),
+    # Linear USDC derivatives.
+    MarketSpec("DERIBIT:BTC_USDC-PERPETUAL", "USDC"),
+    MarketSpec("OKEX:BTC-USDC-SWAP", "USDC"),
+    # USD/inverse/coin-margined derivatives, normalized by aggr adapters.
+    MarketSpec("BINANCE_FUTURES:btcusd_perp", "USD_INVERSE"),
+    MarketSpec("BITMEX:XBTUSD", "USD_INVERSE"),
+    MarketSpec("BYBIT:BTCUSD", "USD_INVERSE"),
+    MarketSpec("COINBASE:BTC-PERP-INTX", "USD_INVERSE"),
+    MarketSpec("DERIBIT:BTC-PERPETUAL", "USD_INVERSE"),
+    MarketSpec("HUOBI:BTC-USD", "USD_INVERSE"),
+    MarketSpec("KRAKEN:PI_XBTUSD", "USD_INVERSE"),
+    MarketSpec("KUCOIN:XBTUSDM", "USD_INVERSE"),
+    MarketSpec("MEXC:BTC_USD", "USD_INVERSE"),
+    MarketSpec("OKEX:BTC-USD-SWAP", "USD_INVERSE"),
 )
 
 
-ETH_POLICY = MarketPolicy(
-    base="ETH",
-    version="eth-v1",
-    price_market="BINANCE_FUTURES:ethusdt",
-    markets=(
-        *_specs(
-            "USDT",
-            (
-                "ASTER:ETHUSDT",
-                "BINANCE_FUTURES:ethusdt",
-                "BITFINEX:ETHF0:USTF0",
-                "BITGET:ETHUSDT",
-                "BITMART:ETHUSDT",
-                "BITMEX:ETHUSDT",
-                "BITMEX:ETH_USDT",
-                "BITUNIX:ETHUSDT",
-                "BYBIT:ETHUSDT",
-                "GATEIO:ETH_USDT",
-                "HUOBI:ETH-USDT",
-                "KUCOIN:ETHUSDTM",
-                "MEXC:ETH_USDT",
-                "OKEX:ETH-USDT-SWAP",
-                "PHEMEX:ETHUSDT",
-            ),
-        ),
-        *_specs(
-            "USDC",
-            (
-                "BINANCE_FUTURES:ethusdc",
-                "BITMART:ETHUSDC",
-                "DERIBIT:ETH_USDC-PERPETUAL",
-                "KUCOIN:ETHUSDCM",
-                "PHEMEX:ETHUSDC",
-            ),
-        ),
-        *_specs(
-            "USD",
-            (
-                "BINANCE_FUTURES:ethusd_perp",
-                "BITGET:ETHUSD",
-                "BITGET:ETHPERP",
-                "BITMART:ETHUSD",
-                "BITMEX:ETHUSD",
-                "BYBIT:ETHUSD",
-                "COINBASE:ETH-PERP-INTX",
-                "DERIBIT:ETH-PERPETUAL",
-                "DYDX:ETH-USD",
-                "HUOBI:ETH-USD",
-                "HYPERLIQUID:ETH",
-                "KRAKEN:PF_ETHUSD",
-                "KRAKEN:PI_ETHUSD",
-                "KUCOIN:ETHUSDM",
-                "MEXC:ETH_USD",
-                "OKEX:ETH-USD-SWAP",
-                "PHEMEX:ETHUSD",
-            ),
-        ),
-    ),
+_ETH_MARKETS = (
+    # Linear USDT derivatives.
+    MarketSpec("BINANCE_FUTURES:ethusdt", "USDT"),
+    MarketSpec("BITFINEX:ETHF0:USTF0", "USDT"),
+    MarketSpec("BITGET:ETHUSDT", "USDT"),
+    MarketSpec("BITMEX:ETH_USDT", "USDT"),
+    MarketSpec("BITMEX:ETHUSDT", "USDT"),
+    MarketSpec("BITUNIX:ETHUSDT", "USDT"),
+    MarketSpec("BYBIT:ETHUSDT", "USDT"),
+    MarketSpec("HUOBI:ETH-USDT", "USDT"),
+    MarketSpec("KUCOIN:ETHUSDTM", "USDT"),
+    MarketSpec("OKEX:ETH-USDT-SWAP", "USDT"),
+    # Linear USDC derivatives.
+    MarketSpec("BINANCE_FUTURES:ethusdc", "USDC"),
+    MarketSpec("DERIBIT:ETH_USDC-PERPETUAL", "USDC"),
+    MarketSpec("KUCOIN:ETHUSDCM", "USDC"),
+    # USD/inverse/coin-margined derivatives, normalized by aggr adapters.
+    MarketSpec("BINANCE_FUTURES:ethusd_perp", "USD_INVERSE"),
+    MarketSpec("BITGET:ETHPERP", "USD_INVERSE"),
+    MarketSpec("BITGET:ETHUSD", "USD_INVERSE"),
+    MarketSpec("BITMEX:ETHUSD", "USD_INVERSE"),
+    MarketSpec("BYBIT:ETHUSD", "USD_INVERSE"),
+    MarketSpec("COINBASE:ETH-PERP-INTX", "USD_INVERSE"),
+    MarketSpec("DERIBIT:ETH-PERPETUAL", "USD_INVERSE"),
+    MarketSpec("DYDX:ETH-USD", "USD_INVERSE"),
+    MarketSpec("HUOBI:ETH-USD", "USD_INVERSE"),
+    MarketSpec("HYPERLIQUID:ETH", "USD_INVERSE"),
+    MarketSpec("KRAKEN:PF_ETHUSD", "USD_INVERSE"),
+    MarketSpec("KRAKEN:PI_ETHUSD", "USD_INVERSE"),
+    MarketSpec("KUCOIN:ETHUSDM", "USD_INVERSE"),
+    MarketSpec("OKEX:ETH-USD-SWAP", "USD_INVERSE"),
 )
 
 
 _POLICIES = {
-    "BTC": BTC_POLICY,
-    "ETH": ETH_POLICY,
+    "BTC": MarketPolicy(
+        base="BTC",
+        version="btc-derivatives-v1",
+        price_market="BINANCE_FUTURES:btcusdt",
+        markets=_BTC_MARKETS,
+    ),
+    "ETH": MarketPolicy(
+        base="ETH",
+        version="eth-derivatives-v1",
+        price_market="BINANCE_FUTURES:ethusdt",
+        markets=_ETH_MARKETS,
+    ),
 }
 
 
 def get_market_policy(base: str) -> MarketPolicy:
     base_u = str(base or "").strip().upper()
-
     try:
         return _POLICIES[base_u]
     except KeyError as exc:
-        raise ValueError(
-            "Collector version 1 supports BTC and ETH only"
-        ) from exc
+        raise ValueError("Collector version 1 supports BTC and ETH only") from exc
+
+
+BTC_POLICY = _POLICIES["BTC"]
+ETH_POLICY = _POLICIES["ETH"]

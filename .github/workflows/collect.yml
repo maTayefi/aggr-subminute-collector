@@ -1,0 +1,78 @@
+name: Collect AGGR five-second archive
+
+on:
+  schedule:
+    # Avoid the busiest top-of-hour scheduling period.
+    - cron: "17 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - collect
+
+concurrency:
+  # Scheduled and manually dispatched publisher runs share this group.
+  # Do not cancel an active data-mutating collector.
+  group: aggr-subminute-collector-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    name: Five-second BTC/ETH collection
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      AGGR_COLLECTOR_HF_REPO_ID: maTayefi/smp-aggr-subminute
+      AGGR_COLLECTOR_HF_REPO_TYPE: dataset
+      AGGR_COLLECTOR_HF_REVISION: main
+      AGGR_COLLECTOR_HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      AGGR_COLLECTOR_WORK_DIR: .collector_work
+      AGGR_COLLECTOR_ROLLING_REFETCH_HOURS: "3"
+      AGGR_COLLECTOR_RETENTION_DAYS: "90"
+      AGGR_COLLECTOR_SOURCE_FINALIZATION_LAG_SECONDS: "60"
+
+      AGGR_COLLECTOR_REQUEST_TIMEOUT_SECONDS: "30"
+      AGGR_COLLECTOR_REQUEST_MAX_ATTEMPTS: "4"
+      AGGR_COLLECTOR_REQUEST_INITIAL_BACKOFF_SECONDS: "1"
+
+    steps:
+      - name: Check out collector code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14.6
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14.6"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+
+      - name: Run collector tests
+        run: python -m pytest -q
+
+      - name: Resolve workflow mode
+        id: mode
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "value=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=collect" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run collector
+        run: python -m collector "${{ steps.mode.outputs.value }}"

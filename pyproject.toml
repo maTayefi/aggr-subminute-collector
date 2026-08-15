@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aggr-subminute-collector"
+version = "0.1.0"
+description = "Autonomous five-second aggr.trade BTC/ETH futures archive collector"
+requires-python = ">=3.14.6"
+dynamic = ["dependencies"]
+
+[project.scripts]
+aggr-subminute-collector = "collector.cli:main"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["collector*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.black]
+target-version = ["py314"]

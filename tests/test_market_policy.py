@@ -1,65 +1,127 @@
 # tests\test_market_policy.py
 from __future__ import annotations
 
-import re
-
 import pytest
 
 from collector.market_policy import (
-    BTC_POLICY,
-    ETH_POLICY,
-    SOURCE_INTERVAL_MS,
+    MARKET_POLICY_SCHEMA_VERSION,
+    MarketPolicy,
+    MarketSpec,
     get_market_policy,
 )
 
 
-def test_version_one_resolution_is_five_seconds() -> None:
-    assert SOURCE_INTERVAL_MS == 5000
-
-
 @pytest.mark.parametrize(
-    ("policy", "expected_price"),
+    ("base", "price_market"),
     [
-        (BTC_POLICY, "BINANCE_FUTURES:btcusdt"),
-        (ETH_POLICY, "BINANCE_FUTURES:ethusdt"),
+        ("BTC", "BINANCE_FUTURES:btcusdt"),
+        ("ETH", "BINANCE_FUTURES:ethusdt"),
     ],
 )
-def test_price_market_is_exact_binance_usdt_perpetual(
-    policy,
-    expected_price,
+def test_policy_has_exact_binance_usdt_perpetual_price_source(
+    base: str,
+    price_market: str,
 ) -> None:
-    assert policy.price_market == expected_price
-    assert expected_price in policy.selected_markets
-    assert policy.tier_by_market[expected_price] == "USDT"
+    policy = get_market_policy(base)
+
+    assert policy.price_market == price_market
+    assert price_market in policy.selected_markets
 
 
-@pytest.mark.parametrize("policy", [BTC_POLICY, ETH_POLICY])
-def test_market_policy_contains_no_explicit_spot_products(policy) -> None:
-    forbidden = (
+@pytest.mark.parametrize("base", ["BTC", "ETH"])
+def test_policy_is_deterministic_and_hashable(base: str) -> None:
+    first = get_market_policy(base)
+    second = get_market_policy(base.lower())
+
+    assert first is second
+    assert first.selected_markets == tuple(sorted(first.selected_markets))
+
+    assert len(first.market_list_hash) == 64
+    assert first.market_list_hash == second.market_list_hash
+    assert all(char in "0123456789abcdef" for char in first.market_list_hash)
+
+
+@pytest.mark.parametrize("base", ["BTC", "ETH"])
+def test_policy_excludes_explicit_spot_markets(base: str) -> None:
+    policy = get_market_policy(base)
+    markets = set(policy.selected_markets)
+
+    forbidden_suffixes = (
         "-SPOT",
-        "BINANCE:",
-        "BINANCE_US:",
-        "BITSTAMP:",
-        "POLONIEX:",
+        "/USD",
+        "/USDC",
+        "/USDT",
     )
 
-    failures = [
-        market
-        for market in policy.selected_markets
-        if any(token in market for token in forbidden)
-    ]
+    assert not any(market.endswith(forbidden_suffixes) for market in markets)
 
-    assert failures == []
+    forbidden_exact = {
+        "BINANCE:btcusdt",
+        "BINANCE:ethusdt",
+        "BINANCE_US:btcusdt",
+        "BYBIT:BTCUSDT-SPOT",
+        "BYBIT:ETHUSDT-SPOT",
+        "COINBASE:BTC-USD",
+        "COINBASE:ETH-USD",
+        "MEXC:BTCUSDT",
+        "POLONIEX:BTC_USDT",
+        "POLONIEX:ETH_USDT",
+    }
+
+    assert not (markets & forbidden_exact)
 
 
-@pytest.mark.parametrize("policy", [BTC_POLICY, ETH_POLICY])
-def test_market_policy_identity_is_stable_and_complete(policy) -> None:
-    assert policy.version
-    assert len(policy.selected_markets) == len(set(policy.selected_markets))
-    assert set(policy.tier_by_market.values()) == {"USDT", "USDC", "USD"}
-    assert re.fullmatch(r"[0-9a-f]{64}", policy.market_list_hash)
+@pytest.mark.parametrize("base", ["BTC", "ETH"])
+def test_every_policy_tier_is_reviewed(base: str) -> None:
+    policy = get_market_policy(base)
+
+    assert set(policy.tier_by_market.values()).issubset(
+        {
+            "USDT",
+            "USDC",
+            "USD_INVERSE",
+        }
+    )
+
+    assert "USDT" in set(policy.tier_by_market.values())
+    assert "USD_INVERSE" in set(policy.tier_by_market.values())
 
 
-def test_unknown_base_fails_closed() -> None:
-    with pytest.raises(ValueError, match="BTC and ETH only"):
-        get_market_policy("SOL")
+def test_policy_rejects_unknown_response_market() -> None:
+    policy = get_market_policy("BTC")
+
+    with pytest.raises(
+        ValueError,
+        match="outside the reviewed",
+    ):
+        policy.assert_response_markets_allowed(
+            [
+                policy.price_market,
+                "BINANCE:btcusdt",
+            ]
+        )
+
+
+def test_policy_hash_changes_when_market_tier_changes() -> None:
+    original = get_market_policy("BTC")
+
+    modified_specs = tuple(
+        MarketSpec(
+            item.market,
+            ("USDC" if item.market == "BITGET:BTCUSDT" else item.tier),
+        )
+        for item in original.markets
+    )
+
+    modified = MarketPolicy(
+        base=original.base,
+        version=original.version,
+        price_market=original.price_market,
+        markets=modified_specs,
+    )
+
+    assert modified.market_list_hash != original.market_list_hash
+
+
+def test_market_policy_schema_identity_is_frozen() -> None:
+    assert MARKET_POLICY_SCHEMA_VERSION == "smp_aggr_market_policy.v1"

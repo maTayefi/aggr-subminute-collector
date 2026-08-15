@@ -38,3 +38,5 @@ staging/
 .idea/
 .DS_Store
 Thumbs.db
+totext.bat
+project_contents.txt

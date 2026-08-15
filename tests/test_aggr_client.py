@@ -11,7 +11,6 @@ from collector.aggr_client import (
 )
 from collector.market_policy import BTC_POLICY
 
-
 FROM_MS = 1_786_560_615_000
 TO_MS = 1_786_560_645_000
 
@@ -74,8 +73,7 @@ def test_builds_encoded_get_url_with_half_open_boundaries() -> None:
     )
 
     assert url.startswith(
-        "https://api.aggr.trade/historical/"
-        f"{FROM_MS}/{TO_MS}/5000/"
+        "https://api.aggr.trade/historical/" f"{FROM_MS}/{TO_MS}/5000/"
     )
 
     decoded = unquote(url.rsplit("/", 1)[-1])
@@ -164,6 +162,19 @@ def test_exact_duplicates_are_collapsed() -> None:
 def test_conflicting_duplicates_fail_closed() -> None:
     first = _btc_row(vbuy=100.0)
     second = _btc_row(vbuy=101.0)
+
+    with pytest.raises(ValueError, match="Conflicting AGGR rows"):
+        parse_aggr_historical_payload(
+            _payload([first, second]),
+            policy=BTC_POLICY,
+            from_ms=FROM_MS,
+            to_ms=TO_MS,
+        )
+
+
+def test_sub_nanoscopic_duplicate_difference_is_still_a_conflict() -> None:
+    first = _btc_row(vbuy=100.0)
+    second = _btc_row(vbuy=100.0 + 5e-10)
 
     with pytest.raises(ValueError, match="Conflicting AGGR rows"):
         parse_aggr_historical_payload(
@@ -263,3 +274,69 @@ def test_malformed_ohlc_is_rejected() -> None:
             from_ms=FROM_MS,
             to_ms=TO_MS,
         )
+
+
+def test_rejects_fractional_millisecond_boundary_instead_of_truncating() -> None:
+    with pytest.raises(ValueError, match="millisecond integer"):
+        build_historical_url(
+            from_ms=float(FROM_MS) + 0.5,
+            to_ms=TO_MS,
+            timeframe_ms=5000,
+            markets=BTC_POLICY.selected_markets,
+        )
+
+
+def test_parser_rejects_non_five_second_timeframe() -> None:
+    with pytest.raises(
+        ValueError,
+        match="requires timeframe_ms=5000",
+    ):
+        parse_aggr_historical_payload(
+            _payload([_btc_row()]),
+            policy=BTC_POLICY,
+            from_ms=FROM_MS,
+            to_ms=TO_MS,
+            timeframe_ms=10_000,
+        )
+
+
+def test_rejects_fractional_timeframe_instead_of_truncating() -> None:
+    with pytest.raises(ValueError, match="timeframe_ms must be an integer"):
+        build_historical_url(
+            from_ms=FROM_MS,
+            to_ms=TO_MS,
+            timeframe_ms=5000.9,
+            markets=BTC_POLICY.selected_markets,
+        )
+
+
+def test_rejects_fractional_response_column_index() -> None:
+    payload = _payload([_btc_row()])
+    payload["columns"]["vbuy"] = 10.9
+
+    with pytest.raises(ValueError, match="column index.*vbuy.*invalid"):
+        parse_aggr_historical_payload(
+            payload,
+            policy=BTC_POLICY,
+            from_ms=FROM_MS,
+            to_ms=TO_MS,
+        )
+
+
+def test_successful_empty_response_accepts_empty_column_map() -> None:
+    parsed = parse_aggr_historical_payload(
+        {
+            "format": "point",
+            "columns": {},
+            "results": [],
+        },
+        policy=BTC_POLICY,
+        from_ms=FROM_MS,
+        to_ms=TO_MS,
+    )
+
+    assert parsed.points == ()
+    assert parsed.source_row_count == 0
+    assert parsed.exact_duplicates_dropped == 0
+    assert parsed.request_from_ms == FROM_MS
+    assert parsed.request_to_ms == TO_MS

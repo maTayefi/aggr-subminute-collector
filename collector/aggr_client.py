@@ -24,7 +24,6 @@ from collector.models import (
     validate_nullable_ohlc,
 )
 
-
 AGGR_HISTORICAL_BASE_URL = "https://api.aggr.trade/historical"
 
 _REQUIRED_COLUMNS = {
@@ -41,6 +40,39 @@ _REQUIRED_COLUMNS = {
     "vbuy",
     "vsell",
 }
+
+
+def _strict_integer(
+    name: str,
+    value: Any,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> int:
+    """Parse an exact integer without truncating floats or decimal strings."""
+
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, not bool")
+
+    if isinstance(value, int):
+        output = value
+    elif isinstance(value, str):
+        text = value.strip()
+
+        if not text or not text.isdigit():
+            raise ValueError(f"{name} must be an integer; got {value!r}")
+
+        output = int(text)
+    else:
+        raise ValueError(f"{name} must be an integer; got {value!r}")
+
+    if positive and output <= 0:
+        raise ValueError(f"{name} must be > 0; got {output}")
+
+    if nonnegative and output < 0:
+        raise ValueError(f"{name} must be >= 0; got {output}")
+
+    return output
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,15 +94,28 @@ def _strict_ms_boundary(
     *,
     interval_ms: int,
 ) -> int:
+    """Validate one exact UNIX-millisecond integer boundary.
+
+    Do not silently truncate values such as ``12345.9`` to ``12345``. Source
+    request ownership and hourly partition coverage depend on exact boundaries.
+    """
+
     if isinstance(value, bool):
         raise ValueError(f"{name} must be an integer timestamp, not bool")
 
-    try:
-        output = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{name} must be a UNIX millisecond integer; got {value!r}"
-        ) from exc
+    if isinstance(value, int):
+        output = value
+    elif isinstance(value, str):
+        text = value.strip()
+
+        if not text or not text.isdigit():
+            raise ValueError(
+                f"{name} must be a UNIX millisecond integer; got {value!r}"
+            )
+
+        output = int(text)
+    else:
+        raise ValueError(f"{name} must be a UNIX millisecond integer; got {value!r}")
 
     if output <= 0:
         raise ValueError(f"{name} must be positive; got {output}")
@@ -91,7 +136,11 @@ def build_historical_url(
     markets: Iterable[str],
     base_url: str = AGGR_HISTORICAL_BASE_URL,
 ) -> str:
-    interval = int(timeframe_ms)
+    interval = _strict_integer(
+        "timeframe_ms",
+        timeframe_ms,
+        positive=True,
+    )
 
     if interval != SOURCE_INTERVAL_MS:
         raise ValueError(
@@ -115,9 +164,7 @@ def build_historical_url(
         )
 
     normalized_markets = [
-        str(market or "").strip()
-        for market in markets
-        if str(market or "").strip()
+        str(market or "").strip() for market in markets if str(market or "").strip()
     ]
 
     if not normalized_markets:
@@ -131,10 +178,7 @@ def build_historical_url(
         safe="",
     )
 
-    return (
-        f"{str(base_url).rstrip('/')}/"
-        f"{start}/{end}/{interval}/{encoded_markets}"
-    )
+    return f"{str(base_url).rstrip('/')}/" f"{start}/{end}/{interval}/{encoded_markets}"
 
 
 def _column_map(payload: dict[str, Any]) -> dict[str, int]:
@@ -145,31 +189,23 @@ def _column_map(payload: dict[str, Any]) -> dict[str, int]:
 
     missing = sorted(_REQUIRED_COLUMNS - set(columns))
     if missing:
-        raise ValueError(
-            f"AGGR response is missing required columns: {missing}"
-        )
+        raise ValueError(f"AGGR response is missing required columns: {missing}")
 
     output: dict[str, int] = {}
 
     for name in _REQUIRED_COLUMNS:
         raw_index = columns.get(name)
 
-        if isinstance(raw_index, bool):
-            raise ValueError(
-                f"AGGR column index for {name!r} must be an integer"
-            )
-
         try:
-            index = int(raw_index)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"AGGR column index for {name!r} is invalid: {raw_index!r}"
-            ) from exc
-
-        if index < 0:
-            raise ValueError(
-                f"AGGR column index for {name!r} must be non-negative"
+            index = _strict_integer(
+                f"AGGR column index for {name!r}",
+                raw_index,
+                nonnegative=True,
             )
+        except ValueError as exc:
+            raise ValueError(
+                f"AGGR column index for {name!r} is invalid: " f"{raw_index!r}"
+            ) from exc
 
         output[name] = index
 
@@ -189,9 +225,7 @@ def _row_value(
     index = columns[name]
 
     if index >= len(row):
-        raise ValueError(
-            f"AGGR row has no value for column {name!r} at index {index}"
-        )
+        raise ValueError(f"AGGR row has no value for column {name!r} at index {index}")
 
     return row[index]
 
@@ -205,21 +239,15 @@ def _timestamp_seconds(
     interval_ms: int,
 ) -> int:
     if isinstance(raw, bool):
-        raise ValueError(
-            f"AGGR row {row_number}: time must be numeric, not bool"
-        )
+        raise ValueError(f"AGGR row {row_number}: time must be numeric, not bool")
 
     try:
         numeric = float(raw)
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"AGGR row {row_number}: invalid time {raw!r}"
-        ) from exc
+        raise ValueError(f"AGGR row {row_number}: invalid time {raw!r}") from exc
 
     if not numeric.is_integer():
-        raise ValueError(
-            f"AGGR row {row_number}: time must be whole UNIX seconds"
-        )
+        raise ValueError(f"AGGR row {row_number}: time must be whole UNIX seconds")
 
     timestamp = int(numeric)
     interval_seconds = interval_ms // 1000
@@ -262,9 +290,7 @@ def _flow_fields(
         # written. Liquidation activity is separate from ordinary CVD, so its
         # buy/sell trade flow is a known zero for this row.
         if raw_lbuy is None and raw_lsell is None:
-            raise ValueError(
-                f"{context}: all trade and liquidation fields are null"
-            )
+            raise ValueError(f"{context}: all trade and liquidation fields are null")
 
         cbuy = 0
         csell = 0
@@ -329,7 +355,16 @@ def parse_aggr_historical_payload(
 ) -> AggrHistoricalResponse:
     """Parse one complete AGGR response into deterministic canonical points."""
 
-    interval = int(timeframe_ms)
+    interval = _strict_integer(
+        "timeframe_ms",
+        timeframe_ms,
+        positive=True,
+    )
+
+    if interval != SOURCE_INTERVAL_MS:
+        raise ValueError(
+            f"Collector version 1 requires timeframe_ms={SOURCE_INTERVAL_MS}"
+        )
 
     start = _strict_ms_boundary(
         "from_ms",
@@ -349,15 +384,34 @@ def parse_aggr_historical_payload(
         raise ValueError("AGGR response must be one JSON object")
 
     if payload.get("format") != "point":
-        raise ValueError(
-            f"Unsupported AGGR response format: {payload.get('format')!r}"
-        )
+        raise ValueError(f"Unsupported AGGR response format: {payload.get('format')!r}")
 
-    columns = _column_map(payload)
     results = payload.get("results")
 
     if not isinstance(results, list):
         raise ValueError("AGGR response results must be a list")
+
+    raw_columns = payload.get("columns")
+
+    if not isinstance(raw_columns, dict):
+        raise ValueError("AGGR response columns must be an object")
+
+    # aggr-server returns columns={} when a successful query contains no rows.
+    # That response still certifies the requested interval as successfully
+    # queried. A non-empty result always requires the complete column map.
+    if not results:
+        if raw_columns:
+            _column_map(payload)
+
+        return AggrHistoricalResponse(
+            points=(),
+            exact_duplicates_dropped=0,
+            source_row_count=0,
+            request_from_ms=start,
+            request_to_ms=end,
+        )
+
+    columns = _column_map(payload)
 
     selected = set(policy.selected_markets)
     tier_by_market = policy.tier_by_market
@@ -367,9 +421,7 @@ def parse_aggr_historical_payload(
 
     for row_number, raw_row in enumerate(results, start=1):
         if not isinstance(raw_row, list):
-            raise ValueError(
-                f"AGGR result row {row_number} must be a list"
-            )
+            raise ValueError(f"AGGR result row {row_number} must be a list")
 
         context = f"AGGR row {row_number}"
 
@@ -381,9 +433,7 @@ def parse_aggr_historical_payload(
             interval_ms=interval,
         )
 
-        market = str(
-            _row_value(raw_row, columns, "market") or ""
-        ).strip()
+        market = str(_row_value(raw_row, columns, "market") or "").strip()
 
         if not market:
             raise ValueError(f"{context}: market must be non-empty")
@@ -438,14 +488,10 @@ def parse_aggr_historical_payload(
             continue
 
         raise ValueError(
-            "Conflicting AGGR rows share the same (time, market) key: "
-            f"{point.key!r}"
+            "Conflicting AGGR rows share the same (time, market) key: " f"{point.key!r}"
         )
 
-    points = tuple(
-        unique[key]
-        for key in sorted(unique)
-    )
+    points = tuple(unique[key] for key in sorted(unique))
 
     return AggrHistoricalResponse(
         points=points,
@@ -500,8 +546,7 @@ class AggrHistoricalClient:
             "Origin": "https://charts.aggr.trade",
             "Referer": "https://charts.aggr.trade/",
             "User-Agent": (
-                "Mozilla/5.0 (compatible; "
-                "smp-aggr-subminute-collector/1.0)"
+                "Mozilla/5.0 (compatible; " "smp-aggr-subminute-collector/1.0)"
             ),
         }
 

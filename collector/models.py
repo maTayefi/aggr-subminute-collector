@@ -96,9 +96,7 @@ def validate_nullable_ohlc(
         return None, None, None, None
 
     if null_count:
-        raise ValueError(
-            f"{context}: OHLC must be either fully present or fully null"
-        )
+        raise ValueError(f"{context}: OHLC must be either fully present or fully null")
 
     o = finite_float(open_, name=f"{context}.open")
     h = finite_float(high, name=f"{context}.high")
@@ -132,9 +130,7 @@ def validate_nullable_ohlc(
         )
 
     if h + tolerance < l_:
-        raise ValueError(
-            f"{context}: high is below low; high={h}, low={l_}"
-        )
+        raise ValueError(f"{context}: high is below low; high={h}, low={l_}")
 
     return o, h, l_, c
 
@@ -210,30 +206,28 @@ class CanonicalMarketPoint:
 def points_identical(
     left: CanonicalMarketPoint,
     right: CanonicalMarketPoint,
-    *,
-    absolute_tolerance: float = 1e-9,
 ) -> bool:
+    """Return True only when two canonical rows are exactly identical.
+
+    Canonical points have already passed finite numeric validation. Therefore,
+    any different stored value under the same ``(time, market)`` key is a
+    conflict, even when the numerical difference is very small.
+
+    Tolerance-based comparison is inappropriate here because it can silently
+    discard a real upstream correction or conflicting overlapping response.
+    """
+
     if left.key != right.key:
         return False
 
-    for a, b in zip(
+    for left_value, right_value in zip(
         left.comparable_values(),
         right.comparable_values(),
     ):
-        if a is None and b is None:
+        if left_value is None and right_value is None:
             continue
 
-        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-            if not math.isclose(
-                float(a),
-                float(b),
-                rel_tol=0.0,
-                abs_tol=absolute_tolerance,
-            ):
-                return False
-            continue
-
-        if a != b:
+        if left_value != right_value:
             return False
 
     return True
