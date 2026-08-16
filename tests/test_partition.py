@@ -84,6 +84,40 @@ def test_partition_merge_rejects_conflicts() -> None:
         )
 
 
+def test_authoritative_refetch_replaces_older_archived_value() -> None:
+    archived = _point(vbuy=100.0)
+    refetched = replace(archived, vbuy=101.0)
+
+    merged, dropped = merge_partition_points(
+        [archived],
+        [refetched],
+        policy=BTC_POLICY,
+        partition_start_ms=PARTITION_START_MS,
+        replace_existing_conflicts=True,
+    )
+
+    assert merged == (refetched,)
+    assert dropped == 0
+
+
+def test_authoritative_refetch_still_rejects_conflicting_incoming_rows() -> None:
+    archived = _point(vbuy=100.0)
+    first_incoming = replace(archived, vbuy=101.0)
+    second_incoming = replace(archived, vbuy=102.0)
+
+    with pytest.raises(
+        ValueError,
+        match="Conflicting incoming hourly partition",
+    ):
+        merge_partition_points(
+            [archived],
+            [first_incoming, second_incoming],
+            policy=BTC_POLICY,
+            partition_start_ms=PARTITION_START_MS,
+            replace_existing_conflicts=True,
+        )
+
+
 def test_partition_merge_rejects_sub_nanoscopic_conflict() -> None:
     first = _point(vbuy=100.0)
     second = replace(first, vbuy=100.0 + 5e-10)

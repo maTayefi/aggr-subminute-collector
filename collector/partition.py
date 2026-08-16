@@ -202,17 +202,27 @@ def merge_partition_points(
     *,
     policy: MarketPolicy,
     partition_start_ms: int,
+    replace_existing_conflicts: bool = False,
 ) -> tuple[tuple[CanonicalMarketPoint, ...], int]:
     """Merge one hourly object by ``(ts_utc, market)``.
 
-    Exact duplicate rows collapse. Conflicting rows fail closed.
+    Exact duplicate rows collapse.
+
+    By default, every conflicting value fails closed. Reconciliation may set
+    ``replace_existing_conflicts=True`` after the complete incoming AGGR
+    response has already passed strict duplicate validation. In that mode, the
+    newly fetched row is authoritative over an older archived row with the same
+    key.
+
+    Conflicts between two incoming rows remain fatal in every mode.
     """
 
     start_ms = _hour_start_ms(partition_start_ms)
     unique: dict[tuple[int, str], CanonicalMarketPoint] = {}
+    incoming_keys_seen: set[tuple[int, str]] = set()
     exact_duplicates = 0
 
-    for point in (*tuple(existing_points), *tuple(incoming_points)):
+    def _validate_point(point: CanonicalMarketPoint) -> None:
         if not isinstance(point, CanonicalMarketPoint):
             raise TypeError(
                 "Hourly partition merge accepts CanonicalMarketPoint values"
@@ -224,6 +234,9 @@ def merge_partition_points(
             partition_start_ms=start_ms,
         )
 
+    for point in tuple(existing_points):
+        _validate_point(point)
+
         previous = unique.get(point.key)
 
         if previous is None:
@@ -232,6 +245,42 @@ def merge_partition_points(
 
         if points_identical(previous, point):
             exact_duplicates += 1
+            continue
+
+        raise ValueError(
+            "Conflicting existing hourly partition rows share the same "
+            f"(ts_utc, market) key: {point.key!r}"
+        )
+
+    for point in tuple(incoming_points):
+        _validate_point(point)
+
+        previous = unique.get(point.key)
+
+        if previous is None:
+            unique[point.key] = point
+            incoming_keys_seen.add(point.key)
+            continue
+
+        if points_identical(previous, point):
+            exact_duplicates += 1
+            incoming_keys_seen.add(point.key)
+            continue
+
+        if point.key in incoming_keys_seen:
+            raise ValueError(
+                "Conflicting incoming hourly partition rows share the same "
+                f"(ts_utc, market) key: {point.key!r}"
+            )
+
+        if replace_existing_conflicts:
+            # parse_aggr_historical_payload() already proved that the complete
+            # incoming response contains at most one canonical value per key.
+            # A differing value here is therefore a source correction relative
+            # to the older archived snapshot, not an unresolved duplicate
+            # inside the new response.
+            unique[point.key] = point
+            incoming_keys_seen.add(point.key)
             continue
 
         raise ValueError(

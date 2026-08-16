@@ -145,6 +145,12 @@ def reconcile_hourly_partition(
         incoming,
         policy=policy,
         partition_start_ms=partition_start_ms,
+        # The incoming response has already passed complete strict parsing:
+        # duplicate keys inside that response either collapsed as exact
+        # duplicates or failed as conflicts. Therefore a differing incoming
+        # value for an older archived key is an authoritative refetch
+        # correction and should replace the prior archived value.
+        replace_existing_conflicts=True,
     )
 
     partition = write_hourly_partition(

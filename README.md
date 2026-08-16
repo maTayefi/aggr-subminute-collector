@@ -57,12 +57,24 @@ Semantics:
 - `vbuy` and `vsell` are USD-like buy/sell notionals;
 - `cbuy` and `csell` are trade counts;
 - `lbuy` and `lsell` are liquidation notionals;
-- exact duplicate `(time, market)` rows may be collapsed;
-- conflicting duplicate rows fail closed;
+- exact duplicate `(time, market)` rows inside one source response may be
+  collapsed;
+- conflicting duplicate rows inside one source response fail closed;
+- during rolling reconciliation, a newly fetched canonical row is authoritative
+  over an older archived row with the same `(time, market)` key. This allows the
+  configured rolling refetch window to publish upstream corrections instead of
+  becoming permanently blocked by the first archived value;
+- rows absent from the new response are retained from the older trusted
+  partition; version 1 does not infer source deletion merely from sparse
+  response absence;
 - successful empty responses may contain `columns={}` and `results=[]`.
 
 The normal rolling collector remains one minute behind the current clock so
 aggr-server's still-changing in-memory pending bars are not archived as final.
+The rolling refetch window still reconciles later upstream corrections to
+already archived keys.
+
+This preserves existing rows absent from the new response. That is safer than treating a successful sparse/empty refetch as an instruction to delete every prior row in that range.
 
 ## Market policy
 
