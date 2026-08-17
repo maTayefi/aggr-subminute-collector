@@ -75,3 +75,36 @@ def test_retention_never_deletes_protected_replacement_paths() -> None:
     )
 
     assert planned == ()
+
+
+def test_retention_respects_atomic_commit_deletion_budget_oldest_first() -> None:
+    files = (
+        "market_points/BTC/5000/2026/08/12/19.parquet",
+        "coverage/BTC/5000/2026/08/12/19.json",
+        "market_points/BTC/5000/2026/08/12/17.parquet",
+        "coverage/BTC/5000/2026/08/12/17.json",
+        "market_points/BTC/5000/2026/08/12/18.parquet",
+        "coverage/BTC/5000/2026/08/12/18.json",
+    )
+
+    planned = plan_retention_deletions(
+        files,
+        cutoff_ms=_ms(2026, 8, 13, 0),
+        max_deletions=3,
+    )
+
+    assert planned == (
+        "coverage/BTC/5000/2026/08/12/17.json",
+        "market_points/BTC/5000/2026/08/12/17.parquet",
+        "coverage/BTC/5000/2026/08/12/18.json",
+    )
+
+
+def test_retention_zero_deletion_budget_is_valid() -> None:
+    planned = plan_retention_deletions(
+        ["market_points/BTC/5000/2026/08/12/17.parquet"],
+        cutoff_ms=_ms(2026, 8, 13, 0),
+        max_deletions=0,
+    )
+
+    assert planned == ()

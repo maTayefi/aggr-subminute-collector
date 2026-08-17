@@ -314,21 +314,31 @@ def plan_collection_publication(
         prepared.window.to_ms - store.settings.retention_days * 86_400_000
     )
 
+    addition_count = len(additions)
+
+    if addition_count > 500:
+        raise ValueError(
+            "Prepared collection additions alone exceed the 500-operation "
+            "Hugging Face commit limit. Split the manual collection window."
+        )
+
+    deletion_budget = 500 - addition_count
+
     deletions = plan_retention_deletions(
         repository_files,
         cutoff_ms=retention_cutoff_ms,
         protected_paths=additions,
+        max_deletions=deletion_budget,
     )
 
-    operation_count = len(additions) + len(deletions)
+    operation_count = addition_count + len(deletions)
     if operation_count <= 0:
         raise RuntimeError("Prepared collection publication plan is empty")
 
     if operation_count > 500:
-        raise ValueError(
-            "Prepared collection requires more than 500 Hugging Face "
-            "add/delete operations. Split the manual collection window or "
-            "perform bounded retention maintenance first."
+        raise RuntimeError(
+            "Prepared collection exceeded the 500-operation Hugging Face "
+            "commit limit after bounded retention planning."
         )
 
     return PlannedCollectionPublication(

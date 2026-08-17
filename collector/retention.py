@@ -61,8 +61,15 @@ def plan_retention_deletions(
     *,
     cutoff_ms: int,
     protected_paths: Iterable[str] = (),
+    max_deletions: int = 500,
 ) -> tuple[str, ...]:
-    """Plan explicit deletion of collector objects whose hour ended by cutoff."""
+    """Plan a bounded oldest-first collector retention deletion set.
+
+    ``max_deletions`` is the deletion share of the enclosing atomic commit
+    operation budget. Additions and replacements consume the same Hugging Face
+    commit-operation limit, so retention must not independently reserve all 500
+    operations.
+    """
 
     if isinstance(cutoff_ms, bool) or not isinstance(cutoff_ms, int):
         raise ValueError("cutoff_ms must be an integer")
@@ -70,11 +77,17 @@ def plan_retention_deletions(
     if cutoff_ms <= 0:
         raise ValueError("cutoff_ms must be positive")
 
+    if isinstance(max_deletions, bool) or not isinstance(max_deletions, int):
+        raise ValueError("max_deletions must be an integer")
+
+    if max_deletions < 0 or max_deletions > 500:
+        raise ValueError("max_deletions must be inside [0, 500]")
+
     protected = {
         normalize_repo_path(path) for path in protected_paths if str(path or "").strip()
     }
 
-    expired: set[str] = set()
+    expired: list[tuple[int, str]] = []
 
     for raw_path in repository_files:
         if not str(raw_path or "").strip():
@@ -93,12 +106,13 @@ def plan_retention_deletions(
         # Retain any hour which still intersects the configured retention
         # window. Delete only when the complete hour ended at/before cutoff.
         if partition_start_ms + _HOUR_MS <= cutoff_ms:
-            expired.add(path)
+            expired.append((partition_start_ms, path))
 
-    if len(expired) > 500:
-        raise ValueError(
-            "Retention planned more than 500 explicit deletions in one run. "
-            "Refusing an unexpectedly broad archive mutation."
-        )
+    # Oldest partitions are removed first. Path is the deterministic tie-breaker
+    # between a partition's coverage JSON and Parquet object.
+    expired.sort(key=lambda item: (item[0], item[1]))
 
-    return tuple(sorted(expired))
+    return tuple(
+        path
+        for _partition_start_ms, path in expired[:max_deletions]
+    )

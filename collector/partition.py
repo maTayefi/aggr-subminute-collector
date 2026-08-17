@@ -146,7 +146,28 @@ def partition_data_path(
 def partition_start_ms_for_point(
     point: CanonicalMarketPoint,
 ) -> int:
-    timestamp_ms = int(point.ts_utc_seconds) * 1000
+    if not isinstance(point, CanonicalMarketPoint):
+        raise TypeError(
+            "partition_start_ms_for_point requires CanonicalMarketPoint"
+        )
+
+    raw_timestamp = point.ts_utc_seconds
+
+    if isinstance(raw_timestamp, bool) or not isinstance(raw_timestamp, int):
+        raise ValueError(
+            "Point timestamp must be an exact UNIX-seconds integer; "
+            f"got {raw_timestamp!r}"
+        )
+
+    interval_seconds = SOURCE_INTERVAL_MS // 1000
+
+    if raw_timestamp <= 0 or raw_timestamp % interval_seconds != 0:
+        raise ValueError(
+            f"Point timestamp must align to {interval_seconds} seconds; "
+            f"got {raw_timestamp!r}"
+        )
+
+    timestamp_ms = raw_timestamp * 1000
     return timestamp_ms - (timestamp_ms % 3_600_000)
 
 
@@ -156,8 +177,24 @@ def _assert_point_owned(
     policy: MarketPolicy,
     partition_start_ms: int,
 ) -> None:
+    raw_timestamp = point.ts_utc_seconds
+
+    if isinstance(raw_timestamp, bool) or not isinstance(raw_timestamp, int):
+        raise ValueError(
+            f"Point timestamp must be an exact UNIX-seconds integer; "
+            f"got {raw_timestamp!r}"
+        )
+
+    interval_seconds = SOURCE_INTERVAL_MS // 1000
+
+    if raw_timestamp <= 0 or raw_timestamp % interval_seconds != 0:
+        raise ValueError(
+            f"Point timestamp must align to {interval_seconds} seconds; "
+            f"got {raw_timestamp!r}"
+        )
+
     partition_end_ms = partition_start_ms + 3_600_000
-    timestamp_ms = int(point.ts_utc_seconds) * 1000
+    timestamp_ms = raw_timestamp * 1000
 
     if timestamp_ms < partition_start_ms or timestamp_ms >= partition_end_ms:
         raise ValueError(
@@ -194,6 +231,47 @@ def _assert_point_owned(
             f"Point {point.key!r} has tier {point.market_tier!r}; "
             f"expected {expected_tier!r}"
         )
+
+    context = f"Canonical point {point.key!r}"
+
+    # CanonicalMarketPoint type annotations are not runtime validation. The
+    # partition writer is a final archive trust boundary and must reject a
+    # malformed directly constructed dataclass instead of relying only on the
+    # normal AGGR response parser.
+    validate_nullable_ohlc(
+        open_=point.open,
+        high=point.high,
+        low=point.low,
+        close=point.close,
+        context=context,
+    )
+
+    nonnegative_count(
+        point.cbuy,
+        name=f"{context}.cbuy",
+    )
+    nonnegative_count(
+        point.csell,
+        name=f"{context}.csell",
+    )
+    nonnegative_float(
+        point.vbuy,
+        name=f"{context}.vbuy",
+    )
+    nonnegative_float(
+        point.vsell,
+        name=f"{context}.vsell",
+    )
+    nonnegative_float(
+        point.lbuy,
+        name=f"{context}.lbuy",
+        allow_none=True,
+    )
+    nonnegative_float(
+        point.lsell,
+        name=f"{context}.lsell",
+        allow_none=True,
+    )
 
 
 def merge_partition_points(
@@ -424,12 +502,36 @@ def write_hourly_partition(
 
 
 def _timestamp_seconds(value: Any) -> int:
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            raise ValueError("Parquet ts_utc values must be timezone-aware")
-        return int(value.astimezone(timezone.utc).timestamp())
+    if not isinstance(value, datetime):
+        raise ValueError(
+            f"Parquet ts_utc must decode as a datetime; got {value!r}"
+        )
 
-    raise ValueError(f"Parquet ts_utc must decode as a datetime; got {value!r}")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Parquet ts_utc values must be timezone-aware")
+
+    value_utc = value.astimezone(timezone.utc)
+
+    # PARQUET_SCHEMA stores millisecond timestamps, so a malformed or manually
+    # produced file can contain subsecond values even though collector output
+    # must align to exact five-second buckets. Never truncate those values with
+    # int(datetime.timestamp()).
+    if value_utc.microsecond != 0:
+        raise ValueError(
+            "Parquet ts_utc values must be whole-second aligned; "
+            f"got {value_utc!r}"
+        )
+
+    timestamp = int(value_utc.timestamp())
+    interval_seconds = SOURCE_INTERVAL_MS // 1000
+
+    if timestamp <= 0 or timestamp % interval_seconds != 0:
+        raise ValueError(
+            f"Parquet ts_utc values must align to {interval_seconds} seconds; "
+            f"got {value_utc!r}"
+        )
+
+    return timestamp
 
 
 def _point_from_record(

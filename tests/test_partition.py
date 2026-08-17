@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from collector.market_policy import (
@@ -14,6 +16,7 @@ from collector.models import CanonicalMarketPoint
 from collector.partition import (
     merge_partition_points,
     partition_data_path,
+    partition_start_ms_for_point,
     read_hourly_partition,
     write_hourly_partition,
 )
@@ -189,4 +192,123 @@ def test_partition_rejects_point_from_another_hour(
             policy=BTC_POLICY,
             partition_start_ms=PARTITION_START_MS,
             points=[point],
+        )
+
+
+def test_partition_rejects_non_five_second_point_timestamp(
+    tmp_path: Path,
+) -> None:
+    point = _point(timestamp=1_786_560_616)
+
+    with pytest.raises(ValueError, match="align to 5 seconds"):
+        write_hourly_partition(
+            tmp_path,
+            policy=BTC_POLICY,
+            partition_start_ms=PARTITION_START_MS,
+            points=[point],
+        )
+
+
+def test_partition_rejects_non_integer_point_timestamp(
+    tmp_path: Path,
+) -> None:
+    point = _point()
+
+    # Type annotations are not runtime validation. A direct caller can still
+    # construct a dataclass carrying a fractional timestamp.
+    malformed = replace(
+        point,
+        ts_utc_seconds=1_786_560_615.5,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError, match="exact UNIX-seconds integer"):
+        write_hourly_partition(
+            tmp_path,
+            policy=BTC_POLICY,
+            partition_start_ms=PARTITION_START_MS,
+            points=[malformed],
+        )
+
+
+def test_partition_start_helper_rejects_fractional_timestamp() -> None:
+    malformed = replace(
+        _point(),
+        ts_utc_seconds=1_786_560_615.5,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError, match="exact UNIX-seconds integer"):
+        partition_start_ms_for_point(malformed)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"cbuy": 1.5}, r"cbuy.*integer"),
+        ({"csell": -1}, r"csell.*non-negative"),
+        ({"vbuy": -0.01}, r"vbuy.*non-negative"),
+        ({"vsell": float("inf")}, r"vsell.*finite"),
+        ({"lbuy": -1.0}, r"lbuy.*non-negative"),
+        ({"open": None}, r"fully present or fully null"),
+        ({"high": 50.0}, r"high is below"),
+    ],
+)
+def test_partition_writer_rejects_malformed_direct_canonical_point(
+    tmp_path: Path,
+    changes: dict,
+    message: str,
+) -> None:
+    malformed = replace(
+        _point(),
+        **changes,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        write_hourly_partition(
+            tmp_path,
+            policy=BTC_POLICY,
+            partition_start_ms=PARTITION_START_MS,
+            points=[malformed],
+        )
+
+
+def test_partition_reader_rejects_subsecond_parquet_timestamp(
+    tmp_path: Path,
+) -> None:
+    partition = write_hourly_partition(
+        tmp_path,
+        policy=BTC_POLICY,
+        partition_start_ms=PARTITION_START_MS,
+        points=[_point()],
+    )
+
+    table = pq.read_table(partition.local_path)
+    timestamps = table.column("ts_utc").to_pylist()
+
+    # The physical Parquet schema allows millisecond precision. Simulate a
+    # malformed/manually produced object that is one millisecond off the
+    # canonical five-second bucket.
+    timestamps[0] = timestamps[0].replace(microsecond=1_000)
+
+    timestamp_array = pa.array(
+        timestamps,
+        type=table.schema.field("ts_utc").type,
+    )
+    malformed_table = table.set_column(
+        table.schema.get_field_index("ts_utc"),
+        table.schema.field("ts_utc"),
+        timestamp_array,
+    )
+
+    pq.write_table(
+        malformed_table,
+        partition.local_path,
+        version="2.6",
+        compression="zstd",
+    )
+
+    with pytest.raises(ValueError, match="whole-second aligned"):
+        read_hourly_partition(
+            partition.local_path,
+            policy=BTC_POLICY,
+            partition_start_ms=PARTITION_START_MS,
         )

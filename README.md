@@ -303,7 +303,10 @@ before the retention cutoff.
 Only recognized collector-owned paths are deleted. Unrelated repository files
 are ignored.
 
-Retention planning refuses more than 500 explicit deletions in one run.
+Retention planning uses the remaining capacity in the 500-operation atomic
+commit after additions/replacements are counted. When more expired objects
+exist, the oldest recognized collector-owned objects are deleted first and
+later scheduled runs continue the bounded cleanup.
 
 ## Limitations
 
