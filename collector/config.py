@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
+from typing import Any
 
 from pydantic import (
     Field,
@@ -50,6 +52,17 @@ class CollectorSettings(BaseSettings):
     request_max_attempts: int = 4
     request_initial_backoff_seconds: float = 1.0
 
+    # Safe, idempotent Hugging Face read operations:
+    #   - repository revision discovery;
+    #   - repository file listing;
+    #   - immutable-revision object download.
+    #
+    # Write operations such as create_commit() are deliberately excluded from
+    # automatic retry because a response timeout can leave commit success
+    # uncertain.
+    hf_read_max_attempts: int = 4
+    hf_read_initial_backoff_seconds: float = 1.0
+
     @field_validator(
         "hf_repo_id",
         "hf_repo_type",
@@ -67,26 +80,54 @@ class CollectorSettings(BaseSettings):
         "retention_days",
         "source_finalization_lag_seconds",
         "request_max_attempts",
+        "hf_read_max_attempts",
+        mode="before",
     )
     @classmethod
-    def _positive_integer(cls, value: int) -> int:
+    def _positive_integer(cls, value: Any) -> int:
         if isinstance(value, bool):
-            raise ValueError("must be an integer, not bool")
+            raise ValueError("must be a positive integer, not bool")
 
-        output = int(value)
+        if isinstance(value, int):
+            output = value
+
+        elif isinstance(value, str):
+            text = value.strip()
+
+            if not text or not text.isdigit():
+                raise ValueError(f"must be a positive integer; got {value!r}")
+
+            output = int(text)
+
+        else:
+            raise ValueError(f"must be a positive integer; got {value!r}")
+
         if output <= 0:
             raise ValueError("must be > 0")
+
         return output
 
     @field_validator(
         "request_timeout_seconds",
         "request_initial_backoff_seconds",
+        "hf_read_initial_backoff_seconds",
+        mode="before",
     )
     @classmethod
-    def _positive_float(cls, value: float) -> float:
-        output = float(value)
-        if output <= 0.0:
-            raise ValueError("must be > 0")
+    def _positive_float(cls, value: Any) -> float:
+        if isinstance(value, bool):
+            raise ValueError("must be a positive finite number, not bool")
+
+        try:
+            output = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"must be a positive finite number; got {value!r}"
+            ) from exc
+
+        if not math.isfinite(output) or output <= 0.0:
+            raise ValueError("must be finite and > 0")
+
         return output
 
     @model_validator(mode="after")

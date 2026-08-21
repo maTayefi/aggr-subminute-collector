@@ -21,7 +21,18 @@ from collector.partition import (
     partition_data_path,
 )
 
-PARTITION_MANIFEST_SCHEMA = "smp_aggr_subminute_partition.v1"
+PARTITION_MANIFEST_SCHEMA_V1 = "smp_aggr_subminute_partition.v1"
+PARTITION_MANIFEST_SCHEMA_V2 = "smp_aggr_subminute_partition.v2"
+
+# Newly written manifests use v2. The reader continues accepting v1 so rolling
+# reconciliation can upgrade existing archive history without manual deletion.
+PARTITION_MANIFEST_SCHEMA = PARTITION_MANIFEST_SCHEMA_V2
+
+MARKET_COMPLETENESS_UNPROVEN = "unproven"
+
+
+class PartitionPolicyMismatchError(ValueError):
+    """The manifest is structurally readable but belongs to another policy."""
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -63,7 +74,19 @@ class PartitionManifest:
     market_list_hash: str
     selected_markets: tuple[str, ...]
     price_market: str
-    covered_ranges: tuple[CoveredRange, ...]
+
+    # Successful AGGR storage-query provenance. This does not prove complete
+    # observation of every requested market.
+    successful_query_ranges: tuple[CoveredRange, ...]
+
+    # The reviewed AGGR endpoint supplies no market-level completeness proof.
+    market_completeness: str
+
+    @property
+    def covered_ranges(self) -> tuple[CoveredRange, ...]:
+        """Legacy compatibility alias for successful query ranges."""
+
+        return self.successful_query_ranges
 
     @property
     def partition_start_utc(self) -> datetime:
@@ -80,7 +103,7 @@ class PartitionManifest:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "schema": self.schema,
             "base": self.base,
             "source_interval_ms": self.source_interval_ms,
@@ -94,14 +117,25 @@ class PartitionManifest:
             "market_list_hash": self.market_list_hash,
             "selected_markets": list(self.selected_markets),
             "price_market": self.price_market,
-            "covered_ranges": [
-                [
-                    _iso_utc(item.start_ms),
-                    _iso_utc(item.end_ms),
-                ]
-                for item in self.covered_ranges
-            ],
         }
+
+        serialized_ranges = [
+            [
+                _iso_utc(item.start_ms),
+                _iso_utc(item.end_ms),
+            ]
+            for item in self.successful_query_ranges
+        ]
+
+        if self.schema == PARTITION_MANIFEST_SCHEMA_V1:
+            payload["covered_ranges"] = serialized_ranges
+        elif self.schema == PARTITION_MANIFEST_SCHEMA_V2:
+            payload["successful_query_ranges"] = serialized_ranges
+            payload["market_completeness"] = self.market_completeness
+        else:
+            raise ValueError(f"Unsupported partition manifest schema {self.schema!r}")
+
+        return payload
 
     def to_bytes(self) -> bytes:
         return (
@@ -229,7 +263,8 @@ def build_partition_manifest(
         market_list_hash=policy.market_list_hash,
         selected_markets=policy.selected_markets,
         price_market=policy.price_market,
-        covered_ranges=normalized_ranges,
+        successful_query_ranges=normalized_ranges,
+        market_completeness=MARKET_COMPLETENESS_UNPROVEN,
     )
 
 
@@ -323,7 +358,11 @@ def read_partition_manifest(
         raise ValueError("Partition manifest must contain one JSON object")
 
     schema = str(payload.get("schema") or "").strip()
-    if schema != PARTITION_MANIFEST_SCHEMA:
+
+    if schema not in {
+        PARTITION_MANIFEST_SCHEMA_V1,
+        PARTITION_MANIFEST_SCHEMA_V2,
+    }:
         raise ValueError(f"Unsupported partition manifest schema {schema!r}")
 
     base = str(payload.get("base") or "").strip().upper()
@@ -394,53 +433,114 @@ def read_partition_manifest(
         raise ValueError("Partition manifest collector_schema_version is inconsistent")
 
     policy_version = str(payload.get("market_policy_version") or "").strip()
-    if policy_version != policy.version:
-        raise ValueError("Partition manifest market_policy_version is inconsistent")
+
+    if not policy_version:
+        raise ValueError("Partition manifest market_policy_version must be non-empty")
 
     market_list_hash = _strict_sha256(
         "market_list_hash",
         payload.get("market_list_hash"),
     )
-    if market_list_hash != policy.market_list_hash:
-        raise ValueError("Partition manifest market_list_hash is inconsistent")
 
     raw_markets = payload.get("selected_markets")
     if not isinstance(raw_markets, list):
         raise ValueError("selected_markets must be a JSON list")
 
     selected_markets = tuple(str(value or "").strip() for value in raw_markets)
+
     if (
-        any(not market for market in selected_markets)
+        not selected_markets
+        or any(not market for market in selected_markets)
         or len(selected_markets) != len(set(selected_markets))
-        or selected_markets != policy.selected_markets
+        or selected_markets != tuple(sorted(selected_markets))
     ):
-        raise ValueError("Partition manifest selected_markets is inconsistent")
+        raise ValueError(
+            "Partition manifest selected_markets must be non-empty, "
+            "unique, and sorted"
+        )
 
     price_market = str(payload.get("price_market") or "").strip()
-    if price_market != policy.price_market:
-        raise ValueError("Partition manifest price_market is inconsistent")
 
-    raw_ranges = payload.get("covered_ranges")
+    if not price_market or price_market not in selected_markets:
+        raise ValueError(
+            "Partition manifest price_market must be non-empty and included "
+            "in selected_markets"
+        )
+
+    observed_policy_identity = (
+        policy_version,
+        market_list_hash,
+        selected_markets,
+        price_market,
+    )
+    expected_policy_identity = (
+        policy.version,
+        policy.market_list_hash,
+        policy.selected_markets,
+        policy.price_market,
+    )
+
+    if observed_policy_identity != expected_policy_identity:
+        raise PartitionPolicyMismatchError(
+            "Partition manifest belongs to a different market-policy era: "
+            f"expected version={policy.version!r}, "
+            f"hash={policy.market_list_hash!r}; "
+            f"observed version={policy_version!r}, "
+            f"hash={market_list_hash!r}."
+        )
+
+    if schema == PARTITION_MANIFEST_SCHEMA_V1:
+        range_field = "covered_ranges"
+        market_completeness = MARKET_COMPLETENESS_UNPROVEN
+
+        # A v1 field named covered_ranges never carried source evidence capable
+        # of proving market completeness. It is interpreted conservatively as
+        # successful storage-query provenance.
+        if "successful_query_ranges" in payload:
+            raise ValueError(
+                "Version-1 manifest must not contain " "successful_query_ranges"
+            )
+        if "market_completeness" in payload:
+            raise ValueError("Version-1 manifest must not contain market_completeness")
+    else:
+        range_field = "successful_query_ranges"
+        market_completeness = (
+            str(payload.get("market_completeness") or "").strip().lower()
+        )
+
+        if "covered_ranges" in payload:
+            raise ValueError(
+                "Version-2 manifest must not contain legacy covered_ranges"
+            )
+
+        if market_completeness != MARKET_COMPLETENESS_UNPROVEN:
+            raise ValueError(
+                "Version-2 manifest market_completeness must currently be "
+                f"{MARKET_COMPLETENESS_UNPROVEN!r}; got "
+                f"{market_completeness!r}"
+            )
+
+    raw_ranges = payload.get(range_field)
     if not isinstance(raw_ranges, list):
-        raise ValueError("covered_ranges must be a JSON list")
+        raise ValueError(f"{range_field} must be a JSON list")
 
     parsed_ranges: list[CoveredRange] = []
 
     for index, raw_range in enumerate(raw_ranges):
         if not isinstance(raw_range, list) or len(raw_range) != 2:
-            raise ValueError(f"covered_ranges[{index}] must be [start, end]")
+            raise ValueError(f"{range_field}[{index}] must be [start, end]")
 
         range_start = _manifest_timestamp_ms(
-            f"covered_ranges[{index}][0]",
+            f"{range_field}[{index}][0]",
             raw_range[0],
         )
         range_end = _manifest_timestamp_ms(
-            f"covered_ranges[{index}][1]",
+            f"{range_field}[{index}][1]",
             raw_range[1],
         )
 
         if range_start < start_ms or range_end > end_ms or range_end <= range_start:
-            raise ValueError(f"covered_ranges[{index}] is outside its partition")
+            raise ValueError(f"{range_field}[{index}] is outside its partition")
 
         parsed_ranges.append(
             CoveredRange(
@@ -449,18 +549,18 @@ def read_partition_manifest(
             )
         )
 
-    covered_ranges = tuple(parsed_ranges)
+    successful_query_ranges = tuple(parsed_ranges)
 
     canonical_ranges = normalize_covered_ranges(
-        covered_ranges,
+        successful_query_ranges,
         partition_start_ms=start_ms,
         partition_end_ms=end_ms,
     )
 
     # Collector-produced manifests always contain already-sorted, merged,
     # non-overlapping, non-adjacent ranges.
-    if covered_ranges != canonical_ranges:
-        raise ValueError("Partition manifest covered_ranges is not canonical")
+    if successful_query_ranges != canonical_ranges:
+        raise ValueError(f"Partition manifest {range_field} is not canonical")
 
     return PartitionManifest(
         schema=schema,
@@ -476,7 +576,8 @@ def read_partition_manifest(
         market_list_hash=market_list_hash,
         selected_markets=selected_markets,
         price_market=price_market,
-        covered_ranges=covered_ranges,
+        successful_query_ranges=successful_query_ranges,
+        market_completeness=market_completeness,
     )
 
 

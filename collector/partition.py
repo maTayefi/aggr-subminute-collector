@@ -147,9 +147,7 @@ def partition_start_ms_for_point(
     point: CanonicalMarketPoint,
 ) -> int:
     if not isinstance(point, CanonicalMarketPoint):
-        raise TypeError(
-            "partition_start_ms_for_point requires CanonicalMarketPoint"
-        )
+        raise TypeError("partition_start_ms_for_point requires CanonicalMarketPoint")
 
     raw_timestamp = point.ts_utc_seconds
 
@@ -238,7 +236,7 @@ def _assert_point_owned(
     # partition writer is a final archive trust boundary and must reject a
     # malformed directly constructed dataclass instead of relying only on the
     # normal AGGR response parser.
-    validate_nullable_ohlc(
+    validated_ohlc = validate_nullable_ohlc(
         open_=point.open,
         high=point.high,
         low=point.low,
@@ -246,32 +244,51 @@ def _assert_point_owned(
         context=context,
     )
 
-    nonnegative_count(
+    cbuy = nonnegative_count(
         point.cbuy,
         name=f"{context}.cbuy",
     )
-    nonnegative_count(
+    csell = nonnegative_count(
         point.csell,
         name=f"{context}.csell",
     )
-    nonnegative_float(
+    vbuy = nonnegative_float(
         point.vbuy,
         name=f"{context}.vbuy",
     )
-    nonnegative_float(
+    vsell = nonnegative_float(
         point.vsell,
         name=f"{context}.vsell",
     )
-    nonnegative_float(
+    lbuy = nonnegative_float(
         point.lbuy,
         name=f"{context}.lbuy",
         allow_none=True,
     )
-    nonnegative_float(
+    lsell = nonnegative_float(
         point.lsell,
         name=f"{context}.lsell",
         allow_none=True,
     )
+
+    if validated_ohlc[0] is None:
+        assert cbuy is not None
+        assert csell is not None
+        assert vbuy is not None
+        assert vsell is not None
+
+        if cbuy > 0 or csell > 0 or vbuy > 0.0 or vsell > 0.0:
+            raise ValueError(
+                f"{context}: fully null OHLC is permitted only for a "
+                "liquidation-only bucket with zero ordinary trade flow"
+            )
+
+        if not (
+            (lbuy is not None and lbuy > 0.0) or (lsell is not None and lsell > 0.0)
+        ):
+            raise ValueError(
+                f"{context}: fully null OHLC requires positive liquidation " "activity"
+            )
 
 
 def merge_partition_points(
@@ -503,9 +520,7 @@ def write_hourly_partition(
 
 def _timestamp_seconds(value: Any) -> int:
     if not isinstance(value, datetime):
-        raise ValueError(
-            f"Parquet ts_utc must decode as a datetime; got {value!r}"
-        )
+        raise ValueError(f"Parquet ts_utc must decode as a datetime; got {value!r}")
 
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("Parquet ts_utc values must be timezone-aware")
@@ -518,8 +533,7 @@ def _timestamp_seconds(value: Any) -> int:
     # int(datetime.timestamp()).
     if value_utc.microsecond != 0:
         raise ValueError(
-            "Parquet ts_utc values must be whole-second aligned; "
-            f"got {value_utc!r}"
+            "Parquet ts_utc values must be whole-second aligned; " f"got {value_utc!r}"
         )
 
     timestamp = int(value_utc.timestamp())

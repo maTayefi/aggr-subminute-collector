@@ -19,6 +19,7 @@ from collector.hf_store import HuggingFaceArchiveStore
 from collector.manifest import (
     CoveredRange,
     PartitionManifest,
+    PartitionPolicyMismatchError,
     build_partition_manifest,
     partition_manifest_path,
     read_partition_manifest,
@@ -43,6 +44,7 @@ class ReconciledHourlyPartition:
     manifest: PartitionManifest
     manifest_local_path: Path
     existing_manifest_found: bool
+    replaced_incompatible_policy_era: bool
     existing_row_count: int
     incoming_row_count: int
     exact_duplicates_dropped: int
@@ -54,10 +56,12 @@ def _load_existing_remote_partition(
     policy: MarketPolicy,
     partition_start_ms: int,
     remote_revision: str,
+    allow_policy_era_replacement: bool,
 ) -> tuple[
     tuple[CanonicalMarketPoint, ...],
     tuple[CoveredRange, ...],
     PartitionManifest | None,
+    bool,
 ]:
     manifest_file = partition_manifest_path(
         policy.base,
@@ -74,13 +78,23 @@ def _load_existing_remote_partition(
         # An orphan Parquet file can remain after a prior data-first publication
         # failed before its manifest upload. Without a manifest it advertises no
         # trusted coverage and is deliberately not merged.
-        return (), (), None
+        return (), (), None, False
 
-    manifest = read_partition_manifest(
-        manifest_object.local_path,
-        policy=policy,
-        partition_start_ms=partition_start_ms,
-    )
+    try:
+        manifest = read_partition_manifest(
+            manifest_object.local_path,
+            policy=policy,
+            partition_start_ms=partition_start_ms,
+        )
+    except PartitionPolicyMismatchError:
+        if not allow_policy_era_replacement:
+            raise
+
+        # This partition belongs to a deliberately activated later policy era.
+        # Never merge its old-policy rows into the new homogeneous partition.
+        # The new successful query becomes the complete trusted input for the
+        # replacement partition.
+        return (), (), None, True
 
     data_object = store.require_download(
         manifest.data_file,
@@ -112,6 +126,7 @@ def _load_existing_remote_partition(
         existing_points,
         manifest.covered_ranges,
         manifest,
+        False,
     )
 
 
@@ -124,6 +139,7 @@ def reconcile_hourly_partition(
     incoming_points: Iterable[CanonicalMarketPoint],
     fetched_covered_ranges: Iterable[CoveredRange],
     remote_revision: str,
+    allow_policy_era_replacement: bool = False,
 ) -> ReconciledHourlyPartition:
     """Merge one incoming hourly slice with trusted remote archive state."""
 
@@ -133,11 +149,13 @@ def reconcile_hourly_partition(
         existing_points,
         existing_coverage,
         existing_manifest,
+        replaced_incompatible_policy_era,
     ) = _load_existing_remote_partition(
         store,
         policy=policy,
         partition_start_ms=partition_start_ms,
         remote_revision=remote_revision,
+        allow_policy_era_replacement=(allow_policy_era_replacement),
     )
 
     merged, duplicate_count = merge_partition_points(
@@ -197,6 +215,7 @@ def reconcile_hourly_partition(
         manifest=manifest,
         manifest_local_path=manifest_local_path,
         existing_manifest_found=existing_manifest is not None,
+        replaced_incompatible_policy_era=(replaced_incompatible_policy_era),
         existing_row_count=len(existing_points),
         incoming_row_count=len(incoming),
         exact_duplicates_dropped=duplicate_count,

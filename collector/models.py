@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import math
 from typing import Any
 
@@ -65,15 +66,31 @@ def nonnegative_count(
     if isinstance(value, bool):
         raise ValueError(f"{name} must be an integer, not bool")
 
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be an integer; got {value!r}") from exc
+    if isinstance(value, int):
+        output = value
+    elif isinstance(value, Decimal):
+        if not value.is_finite() or value != value.to_integral_value():
+            raise ValueError(f"{name} must be an integer; got {value!r}")
+        output = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
 
-    if not math.isfinite(numeric) or not numeric.is_integer():
-        raise ValueError(f"{name} must be an integer; got {value!r}")
+        try:
+            numeric = Decimal(text)
+        except InvalidOperation as exc:
+            raise ValueError(f"{name} must be an integer; got {value!r}") from exc
 
-    output = int(numeric)
+        if not numeric.is_finite() or numeric != numeric.to_integral_value():
+            raise ValueError(f"{name} must be an integer; got {value!r}")
+
+        output = int(numeric)
+    else:
+        # Binary floats may already have rounded a large or near-integer source
+        # value before validation. Reject them at this exact-integer boundary.
+        raise ValueError(
+            f"{name} must be supplied as an exact integer or decimal string; "
+            f"got {value!r}"
+        )
 
     if output < 0:
         raise ValueError(f"{name} must be non-negative; got {output}")

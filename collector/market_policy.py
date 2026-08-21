@@ -25,6 +25,7 @@ Policy rules
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 import hashlib
 import json
@@ -164,6 +165,168 @@ class MarketPolicy:
             )
 
 
+@dataclass(frozen=True, order=True)
+class MarketPolicyEra:
+    """One policy beginning at an exact UTC-hour boundary."""
+
+    activation_start_ms: int
+    policy: MarketPolicy
+
+    def __post_init__(self) -> None:
+        activation = self.activation_start_ms
+
+        if isinstance(activation, bool) or not isinstance(activation, int):
+            raise ValueError("Policy-era activation_start_ms must be an integer")
+
+        if activation < 0 or activation % 3_600_000 != 0:
+            raise ValueError(
+                "Policy-era activation_start_ms must be a non-negative "
+                "UTC-hour boundary"
+            )
+
+        if not isinstance(self.policy, MarketPolicy):
+            raise TypeError("Policy era requires a MarketPolicy")
+
+
+@dataclass(frozen=True, slots=True)
+class MarketPolicySegment:
+    """One half-open request segment owned by one policy era."""
+
+    start_ms: int
+    end_ms: int
+    activation_start_ms: int
+    policy: MarketPolicy
+
+
+@dataclass(frozen=True)
+class MarketPolicyRegistry:
+    """Ordered policy history for one canonical base."""
+
+    base: str
+    eras: tuple[MarketPolicyEra, ...]
+
+    def __post_init__(self) -> None:
+        base = str(self.base or "").strip().upper()
+
+        if base not in {"BTC", "ETH"}:
+            raise ValueError("Market policy registries support BTC and ETH only")
+
+        eras = tuple(sorted(self.eras))
+
+        if not eras:
+            raise ValueError("Market policy registry must contain at least one era")
+
+        if eras[0].activation_start_ms != 0:
+            raise ValueError(
+                "Market policy registry must begin with a zero-epoch "
+                "compatibility era"
+            )
+
+        activation_values = [era.activation_start_ms for era in eras]
+
+        if len(activation_values) != len(set(activation_values)):
+            raise ValueError(
+                "Market policy registry contains duplicate activation times"
+            )
+
+        versions: set[str] = set()
+
+        for era in eras:
+            if era.policy.base != base:
+                raise ValueError(
+                    "Every policy era must belong to registry base " f"{base!r}"
+                )
+
+            if era.policy.version in versions:
+                raise ValueError(
+                    "Market policy versions must be unique inside one "
+                    f"registry: {era.policy.version!r}"
+                )
+
+            versions.add(era.policy.version)
+
+        object.__setattr__(self, "base", base)
+        object.__setattr__(self, "eras", eras)
+
+    @property
+    def latest_policy(self) -> MarketPolicy:
+        return self.eras[-1].policy
+
+    def era_for_timestamp_ms(
+        self,
+        timestamp_ms: int,
+    ) -> MarketPolicyEra:
+        if (
+            isinstance(timestamp_ms, bool)
+            or not isinstance(timestamp_ms, int)
+            or timestamp_ms < 0
+        ):
+            raise ValueError(
+                "Policy lookup timestamp_ms must be a non-negative integer"
+            )
+
+        starts = [era.activation_start_ms for era in self.eras]
+        index = bisect_right(starts, timestamp_ms) - 1
+
+        if index < 0:
+            raise RuntimeError("No market policy era owns the requested timestamp")
+
+        return self.eras[index]
+
+    def segments_for_range(
+        self,
+        from_ms: int,
+        to_ms: int,
+    ) -> tuple[MarketPolicySegment, ...]:
+        if (
+            isinstance(from_ms, bool)
+            or not isinstance(from_ms, int)
+            or isinstance(to_ms, bool)
+            or not isinstance(to_ms, int)
+        ):
+            raise ValueError("Policy-segment boundaries must be integers")
+
+        if (
+            from_ms <= 0
+            or to_ms <= from_ms
+            or from_ms % SOURCE_INTERVAL_MS != 0
+            or to_ms % SOURCE_INTERVAL_MS != 0
+        ):
+            raise ValueError(
+                "Policy-segment range must be a positive non-empty "
+                "five-second-aligned [from, to) range"
+            )
+
+        starts = [era.activation_start_ms for era in self.eras]
+
+        output: list[MarketPolicySegment] = []
+        cursor = from_ms
+
+        while cursor < to_ms:
+            era_index = bisect_right(starts, cursor) - 1
+            era = self.eras[era_index]
+
+            next_activation = (
+                starts[era_index + 1] if era_index + 1 < len(starts) else to_ms
+            )
+            segment_end = min(to_ms, next_activation)
+
+            if segment_end <= cursor:
+                raise RuntimeError("Market policy registry produced an empty segment")
+
+            output.append(
+                MarketPolicySegment(
+                    start_ms=cursor,
+                    end_ms=segment_end,
+                    activation_start_ms=era.activation_start_ms,
+                    policy=era.policy,
+                )
+            )
+            cursor = segment_end
+
+        return tuple(output)
+
+
 _BTC_MARKETS = (
     # Linear USDT derivatives.
     MarketSpec("BINANCE_FUTURES:btcusdt", "USDT"),
@@ -229,29 +392,84 @@ _ETH_MARKETS = (
 )
 
 
-_POLICIES = {
-    "BTC": MarketPolicy(
-        base="BTC",
-        version="btc-derivatives-v1",
-        price_market="BINANCE_FUTURES:btcusdt",
-        markets=_BTC_MARKETS,
+BTC_POLICY = MarketPolicy(
+    base="BTC",
+    version="btc-derivatives-v1",
+    price_market="BINANCE_FUTURES:btcusdt",
+    markets=_BTC_MARKETS,
+)
+
+ETH_POLICY = MarketPolicy(
+    base="ETH",
+    version="eth-derivatives-v1",
+    price_market="BINANCE_FUTURES:ethusdt",
+    markets=_ETH_MARKETS,
+)
+
+
+# Option B: transition infrastructure exists, but no future production policy
+# is activated. A real future policy must be added as another explicit era
+# after its market catalog and activation hour are reviewed.
+BTC_POLICY_REGISTRY = MarketPolicyRegistry(
+    base="BTC",
+    eras=(
+        MarketPolicyEra(
+            activation_start_ms=0,
+            policy=BTC_POLICY,
+        ),
     ),
-    "ETH": MarketPolicy(
-        base="ETH",
-        version="eth-derivatives-v1",
-        price_market="BINANCE_FUTURES:ethusdt",
-        markets=_ETH_MARKETS,
+)
+
+ETH_POLICY_REGISTRY = MarketPolicyRegistry(
+    base="ETH",
+    eras=(
+        MarketPolicyEra(
+            activation_start_ms=0,
+            policy=ETH_POLICY,
+        ),
     ),
+)
+
+
+_POLICY_REGISTRIES = {
+    "BTC": BTC_POLICY_REGISTRY,
+    "ETH": ETH_POLICY_REGISTRY,
 }
 
 
-def get_market_policy(base: str) -> MarketPolicy:
+def get_market_policy_registry(
+    base: str,
+) -> MarketPolicyRegistry:
     base_u = str(base or "").strip().upper()
+
     try:
-        return _POLICIES[base_u]
+        return _POLICY_REGISTRIES[base_u]
     except KeyError as exc:
-        raise ValueError("Collector version 1 supports BTC and ETH only") from exc
+        raise ValueError("Collector market policy supports BTC and ETH only") from exc
 
 
-BTC_POLICY = _POLICIES["BTC"]
-ETH_POLICY = _POLICIES["ETH"]
+def get_market_policy(
+    base: str,
+    *,
+    partition_start_ms: int | None = None,
+) -> MarketPolicy:
+    registry = get_market_policy_registry(base)
+
+    if partition_start_ms is None:
+        return registry.latest_policy
+
+    return registry.era_for_timestamp_ms(
+        partition_start_ms,
+    ).policy
+
+
+def market_policy_segments(
+    base: str,
+    *,
+    from_ms: int,
+    to_ms: int,
+) -> tuple[MarketPolicySegment, ...]:
+    return get_market_policy_registry(base).segments_for_range(
+        from_ms,
+        to_ms,
+    )

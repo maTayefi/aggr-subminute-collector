@@ -4,8 +4,12 @@ from __future__ import annotations
 import pytest
 
 from collector.market_policy import (
+    BTC_POLICY,
+    BTC_POLICY_REGISTRY,
     MARKET_POLICY_SCHEMA_VERSION,
     MarketPolicy,
+    MarketPolicyEra,
+    MarketPolicyRegistry,
     MarketSpec,
     get_market_policy,
 )
@@ -125,3 +129,87 @@ def test_policy_hash_changes_when_market_tier_changes() -> None:
 
 def test_market_policy_schema_identity_is_frozen() -> None:
     assert MARKET_POLICY_SCHEMA_VERSION == "smp_aggr_market_policy.v1"
+
+
+def test_frozen_policy_hashes_match_consumer_release_contract() -> None:
+    btc = get_market_policy("BTC")
+    eth = get_market_policy("ETH")
+
+    assert (
+        btc.market_list_hash
+        == "752dcf5147041ad1aa4c4f5404190f140e40d9282dc2541a3a03a7267dbcd05a"
+    )
+    assert (
+        eth.market_list_hash
+        == "05589b35e9a959cc8d6015af0b166dc58794a12dd5928578c6e62b915aa79906"
+    )
+
+
+def _synthetic_future_btc_policy() -> MarketPolicy:
+    current = get_market_policy("BTC")
+
+    return MarketPolicy(
+        base="BTC",
+        version="btc-derivatives-synthetic-future",
+        price_market=current.price_market,
+        markets=current.markets,
+    )
+
+
+def test_production_policy_registry_does_not_activate_future_policy() -> None:
+    assert len(BTC_POLICY_REGISTRY.eras) == 1
+    assert BTC_POLICY_REGISTRY.eras[0].activation_start_ms == 0
+    assert BTC_POLICY_REGISTRY.latest_policy is BTC_POLICY
+
+
+def test_policy_registry_splits_exactly_at_utc_hour_boundary() -> None:
+    activation = 1_786_564_800_000
+    future = _synthetic_future_btc_policy()
+
+    registry = MarketPolicyRegistry(
+        base="BTC",
+        eras=(
+            MarketPolicyEra(
+                activation_start_ms=0,
+                policy=BTC_POLICY,
+            ),
+            MarketPolicyEra(
+                activation_start_ms=activation,
+                policy=future,
+            ),
+        ),
+    )
+
+    segments = registry.segments_for_range(
+        activation - 3_600_000,
+        activation + 3_600_000,
+    )
+
+    assert len(segments) == 2
+
+    assert segments[0].start_ms == activation - 3_600_000
+    assert segments[0].end_ms == activation
+    assert segments[0].policy is BTC_POLICY
+
+    assert segments[1].start_ms == activation
+    assert segments[1].end_ms == activation + 3_600_000
+    assert segments[1].policy is future
+
+
+@pytest.mark.parametrize(
+    "activation",
+    [
+        -3_600_000,
+        1,
+        3_599_999,
+        True,
+    ],
+)
+def test_policy_era_requires_exact_nonnegative_utc_hour(
+    activation,
+) -> None:
+    with pytest.raises(ValueError, match="UTC-hour boundary|integer"):
+        MarketPolicyEra(
+            activation_start_ms=activation,
+            policy=BTC_POLICY,
+        )

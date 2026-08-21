@@ -250,6 +250,26 @@ def test_liquidation_only_row_has_zero_trade_flow() -> None:
     assert point.lbuy == pytest.approx(2500.0)
 
 
+def test_parser_rejects_null_ohlc_with_positive_trade_flow() -> None:
+    row = _btc_row()
+
+    # OHLC field indexes in _payload():
+    # close=2, high=4, low=6, open=9.
+    for index in (2, 4, 6, 9):
+        row[index] = None
+
+    with pytest.raises(
+        ValueError,
+        match="fully null OHLC.*zero ordinary trade",
+    ):
+        parse_aggr_historical_payload(
+            _payload([row]),
+            policy=BTC_POLICY,
+            from_ms=FROM_MS,
+            to_ms=TO_MS,
+        )
+
+
 def test_partial_null_trade_fields_are_rejected() -> None:
     row = _btc_row()
     row[1] = None

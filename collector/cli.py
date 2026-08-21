@@ -203,14 +203,18 @@ def _summary(
                 "incoming_row_count": item.incoming_row_count,
                 "existing_row_count": item.existing_row_count,
                 "exact_duplicates_dropped": item.exact_duplicates_dropped,
+                "replaced_incompatible_policy_era": (
+                    item.replaced_incompatible_policy_era
+                ),
                 "data_file": item.partition.data_file,
                 "manifest_file": item.manifest_local_path.relative_to(
                     prepared.staging_root
                 ).as_posix(),
-                "covered_ranges": [
+                "successful_query_ranges": [
                     [value.start_ms, value.end_ms]
-                    for value in item.manifest.covered_ranges
+                    for value in item.manifest.successful_query_ranges
                 ],
+                "market_completeness": (item.manifest.market_completeness),
             }
         )
 
@@ -225,11 +229,28 @@ def _summary(
         "committed_revision": committed_revision or None,
         "source": {
             base: {
-                "source_row_count": response.source_row_count,
-                "unique_row_count": response.unique_row_count,
-                "exact_duplicates_dropped": response.exact_duplicates_dropped,
+                "request_count": len(segments),
+                "source_row_count": sum(
+                    item.response.source_row_count for item in segments
+                ),
+                "unique_row_count": sum(
+                    item.response.unique_row_count for item in segments
+                ),
+                "exact_duplicates_dropped": sum(
+                    item.response.exact_duplicates_dropped for item in segments
+                ),
+                "policy_segments": [
+                    {
+                        "from_ms": item.window.from_ms,
+                        "to_ms": item.window.to_ms,
+                        "activation_start_ms": (item.activation_start_ms),
+                        "market_policy_version": (item.policy.version),
+                        "market_list_hash": (item.policy.market_list_hash),
+                    }
+                    for item in segments
+                ],
             }
-            for base, response in prepared.responses.items()
+            for base, segments in prepared.responses.items()
         },
         "partitions": partitions,
     }

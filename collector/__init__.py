@@ -26,7 +26,10 @@ from collector.hf_store import (
     normalize_repo_path,
 )
 from collector.manifest import (
+    MARKET_COMPLETENESS_UNPROVEN,
     PARTITION_MANIFEST_SCHEMA,
+    PARTITION_MANIFEST_SCHEMA_V1,
+    PARTITION_MANIFEST_SCHEMA_V2,
     CoveredRange,
     PartitionManifest,
     build_partition_manifest,
@@ -36,13 +39,20 @@ from collector.manifest import (
 )
 from collector.market_policy import (
     BTC_POLICY,
+    BTC_POLICY_REGISTRY,
     COLLECTOR_SCHEMA_VERSION,
     ETH_POLICY,
+    ETH_POLICY_REGISTRY,
     MARKET_POLICY_SCHEMA_VERSION,
     SOURCE_INTERVAL_MS,
     MarketPolicy,
+    MarketPolicyEra,
+    MarketPolicyRegistry,
+    MarketPolicySegment,
     MarketSpec,
     get_market_policy,
+    get_market_policy_registry,
+    market_policy_segments,
 )
 from collector.partition import (
     PARQUET_SCHEMA_VERSION,
@@ -61,6 +71,7 @@ from collector.run import (
     CollectionWindow,
     PlannedCollectionPublication,
     PreparedCollectionRun,
+    PreparedPolicyResponse,
     PublishedCollectionRun,
     plan_collection_publication,
     prepare_collection_run,
@@ -82,6 +93,9 @@ __all__ = [
     "MARKET_POLICY_SCHEMA_VERSION",
     "PARQUET_SCHEMA_VERSION",
     "PARTITION_MANIFEST_SCHEMA",
+    "PARTITION_MANIFEST_SCHEMA_V1",
+    "PARTITION_MANIFEST_SCHEMA_V2",
+    "MARKET_COMPLETENESS_UNPROVEN",
     "SOURCE_INTERVAL_MS",
     "AggrHistoricalClient",
     "AggrHistoricalResponse",
@@ -120,4 +134,12 @@ __all__ = [
     "reconcile_hourly_partition",
     "rolling_collection_window",
     "run_collection",
+    "BTC_POLICY_REGISTRY",
+    "ETH_POLICY_REGISTRY",
+    "MarketPolicyEra",
+    "MarketPolicyRegistry",
+    "MarketPolicySegment",
+    "PreparedPolicyResponse",
+    "get_market_policy_registry",
+    "market_policy_segments",
 ]

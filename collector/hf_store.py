@@ -24,8 +24,10 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import shutil
-from typing import Iterable
+import time
+from typing import Callable, Iterable, TypeVar
 
+import httpx
 from huggingface_hub import (
     CommitOperationAdd,
     CommitOperationDelete,
@@ -35,10 +37,105 @@ from huggingface_hub import (
 from huggingface_hub.utils import (
     EntryNotFoundError,
     HfHubHTTPError,
+    LocalEntryNotFoundError,
     RepositoryNotFoundError,
 )
 
 from collector.config import CollectorSettings
+
+_T = TypeVar("_T")
+
+_TRANSIENT_HF_HTTP_STATUS_CODES = {
+    408,  # Request Timeout
+    425,  # Too Early
+    429,  # Too Many Requests
+}
+
+
+def _exception_chain(
+    exc: BaseException,
+) -> tuple[BaseException, ...]:
+    """Return a bounded cause/context chain without cycles."""
+
+    output: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+
+    while current is not None and len(output) < 16:
+        identity = id(current)
+        if identity in seen:
+            break
+
+        seen.add(identity)
+        output.append(current)
+
+        cause = current.__cause__
+        if cause is not None:
+            current = cause
+            continue
+
+        current = current.__context__
+
+    return tuple(output)
+
+
+def _hf_read_error_is_transient(
+    exc: BaseException,
+) -> bool:
+    """Classify retryable Hugging Face read failures.
+
+    ``hf_hub_download`` can wrap an httpx timeout in ``ValueError`` such as:
+
+        ValueError: Force download failed due to the above error.
+
+    Therefore classification must inspect the complete exception chain rather
+    than only the outer exception type.
+
+    Confirmed remote object absence and repository/authentication failures are
+    not transient read retries.
+    """
+
+    for item in _exception_chain(exc):
+        if isinstance(item, LocalEntryNotFoundError):
+            # This means the requested object could not be obtained and no
+            # usable cache entry was available. It is infrastructure state,
+            # not confirmed remote absence, and may recover on retry.
+            return True
+
+        if isinstance(item, RepositoryNotFoundError):
+            return False
+
+        if isinstance(item, EntryNotFoundError):
+            # Confirmed missing remote object. download_optional() owns this
+            # semantic result and must receive the original exception.
+            return False
+
+        if isinstance(
+            item,
+            (
+                httpx.TimeoutException,
+                httpx.TransportError,
+                TimeoutError,
+                ConnectionError,
+            ),
+        ):
+            return True
+
+        if isinstance(item, HfHubHTTPError):
+            response = getattr(item, "response", None)
+            status_code = getattr(response, "status_code", None)
+
+            try:
+                status = int(status_code)
+            except TypeError, ValueError:
+                status = 0
+
+            if status in _TRANSIENT_HF_HTTP_STATUS_CODES or 500 <= status <= 599:
+                return True
+
+            return False
+
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +211,48 @@ class HuggingFaceArchiveStore:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.download_dir.mkdir(parents=True, exist_ok=True)
 
+    def _retry_hf_read(
+        self,
+        operation_label: str,
+        operation: Callable[[], _T],
+    ) -> _T:
+        """Retry one safe/idempotent Hugging Face read operation.
+
+        This helper must not be used for create_commit(), upload, or deletion.
+        A write can succeed remotely while its response times out, making blind
+        replay unsafe.
+        """
+
+        label = str(operation_label or "").strip() or "Hugging Face read"
+        attempts = int(self.settings.hf_read_max_attempts)
+        initial_backoff = float(self.settings.hf_read_initial_backoff_seconds)
+
+        last_error: BaseException | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                return operation()
+
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+
+                if not _hf_read_error_is_transient(exc):
+                    raise
+
+                if attempt >= attempts:
+                    break
+
+                delay = initial_backoff * (2 ** (attempt - 1))
+
+                time.sleep(delay)
+
+        assert last_error is not None
+
+        raise RuntimeError(
+            f"{label} failed after {attempts} attempt(s) because of "
+            "transient Hugging Face transport/cache-resolution errors."
+        ) from last_error
+
     def _download_from_hub(
         self,
         path_in_repo: str,
@@ -125,16 +264,28 @@ class HuggingFaceArchiveStore:
         resolved_revision = str(revision or "").strip() or self.settings.hf_revision
 
         try:
-            downloaded = hf_hub_download(
-                repo_id=self.settings.hf_repo_id,
-                filename=remote_path,
-                repo_type=self.settings.hf_repo_type,
-                revision=resolved_revision,
-                token=self.token,
-                cache_dir=str(self.cache_dir),
-                force_download=bool(force_download),
+            downloaded = self._retry_hf_read(
+                f"Hugging Face download for {remote_path!r}",
+                lambda: hf_hub_download(
+                    repo_id=self.settings.hf_repo_id,
+                    filename=remote_path,
+                    repo_type=self.settings.hf_repo_type,
+                    revision=resolved_revision,
+                    token=self.token,
+                    cache_dir=str(self.cache_dir),
+                    force_download=bool(force_download),
+                ),
             )
+        except LocalEntryNotFoundError as exc:
+            raise RuntimeError(
+                "The collector could not obtain the Hugging Face object "
+                f"{remote_path!r}, and no usable local cached copy was "
+                "available. This is an infrastructure/cache-resolution "
+                "failure, not proof that the remote archive object is absent."
+            ) from exc
         except EntryNotFoundError:
+            # A confirmed remote object absence is handled by
+            # download_optional(). Keep it distinct from local/cache failure.
             raise
         except RepositoryNotFoundError as exc:
             raise RuntimeError(
@@ -297,11 +448,14 @@ class HuggingFaceArchiveStore:
         resolved_revision = str(revision or "").strip() or self.settings.hf_revision
 
         try:
-            files = self.api.list_repo_files(
-                repo_id=self.settings.hf_repo_id,
-                repo_type=self.settings.hf_repo_type,
-                revision=resolved_revision,
-                token=self.token,
+            files = self._retry_hf_read(
+                "Hugging Face repository file listing",
+                lambda: self.api.list_repo_files(
+                    repo_id=self.settings.hf_repo_id,
+                    repo_type=self.settings.hf_repo_type,
+                    revision=resolved_revision,
+                    token=self.token,
+                ),
             )
         except RepositoryNotFoundError as exc:
             raise RuntimeError(
@@ -326,11 +480,14 @@ class HuggingFaceArchiveStore:
         """Return the exact current repository commit SHA."""
 
         try:
-            info = self.api.repo_info(
-                repo_id=self.settings.hf_repo_id,
-                repo_type=self.settings.hf_repo_type,
-                revision=self.settings.hf_revision,
-                token=self.token,
+            info = self._retry_hf_read(
+                "Hugging Face repository revision discovery",
+                lambda: self.api.repo_info(
+                    repo_id=self.settings.hf_repo_id,
+                    repo_type=self.settings.hf_repo_type,
+                    revision=self.settings.hf_revision,
+                    token=self.token,
+                ),
             )
         except RepositoryNotFoundError as exc:
             raise RuntimeError(
@@ -432,6 +589,11 @@ class HuggingFaceArchiveStore:
             for remote_path in sorted(normalized_deletions)
         )
 
+        # Do not pass create_commit() through _retry_hf_read(). If Hugging Face
+        # commits the request but the response times out, publication success is
+        # uncertain. Blind replay can create a duplicate/stale-parent attempt.
+        # Fail closed and let the next scheduled run reconcile against the
+        # repository's actual current revision.
         try:
             commit_info = self.api.create_commit(
                 repo_id=self.settings.hf_repo_id,

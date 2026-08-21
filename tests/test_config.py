@@ -66,3 +66,60 @@ def test_source_finalization_lag_must_align_to_five_seconds() -> None:
             hf_token=SecretStr("test-token"),
             source_finalization_lag_seconds=61,
         )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "rolling_refetch_hours",
+        "retention_days",
+        "source_finalization_lag_seconds",
+        "request_max_attempts",
+        "hf_read_max_attempts",
+    ],
+)
+def test_integer_configuration_rejects_boolean_and_fractional_values(
+    field: str,
+) -> None:
+    for value in (True, False, 1.5, "1.5"):
+        with pytest.raises(
+            ValueError,
+            match="positive integer",
+        ):
+            CollectorSettings(
+                hf_token=SecretStr("test-token"),
+                **{field: value},
+            )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "request_timeout_seconds",
+        "request_initial_backoff_seconds",
+        "hf_read_initial_backoff_seconds",
+    ],
+)
+def test_float_configuration_rejects_nonfinite_and_boolean_values(
+    field: str,
+) -> None:
+    for value in (True, False, float("nan"), float("inf"), -1.0, 0.0):
+        with pytest.raises(
+            ValueError,
+            match="positive finite|finite and > 0",
+        ):
+            CollectorSettings(
+                hf_token=SecretStr("test-token"),
+                **{field: value},
+            )
+
+
+def test_hf_read_retry_configuration_accepts_environment_style_strings() -> None:
+    settings = CollectorSettings(
+        hf_token=SecretStr("test-token"),
+        hf_read_max_attempts="3",
+        hf_read_initial_backoff_seconds="0.25",
+    )
+
+    assert settings.hf_read_max_attempts == 3
+    assert settings.hf_read_initial_backoff_seconds == pytest.approx(0.25)

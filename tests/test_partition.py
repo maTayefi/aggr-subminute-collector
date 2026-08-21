@@ -271,6 +271,29 @@ def test_partition_writer_rejects_malformed_direct_canonical_point(
         )
 
 
+def test_partition_writer_rejects_null_ohlc_with_positive_trade_flow(
+    tmp_path: Path,
+) -> None:
+    malformed = replace(
+        _point(),
+        open=None,
+        high=None,
+        low=None,
+        close=None,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="fully null OHLC.*zero ordinary trade flow",
+    ):
+        write_hourly_partition(
+            tmp_path,
+            policy=BTC_POLICY,
+            partition_start_ms=PARTITION_START_MS,
+            points=[malformed],
+        )
+
+
 def test_partition_reader_rejects_subsecond_parquet_timestamp(
     tmp_path: Path,
 ) -> None:

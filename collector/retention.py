@@ -87,7 +87,10 @@ def plan_retention_deletions(
         normalize_repo_path(path) for path in protected_paths if str(path or "").strip()
     }
 
-    expired: list[tuple[int, str]] = []
+    expired_by_partition: dict[
+        tuple[int, str],
+        list[str],
+    ] = {}
 
     for raw_path in repository_files:
         if not str(raw_path or "").strip():
@@ -98,21 +101,49 @@ def plan_retention_deletions(
         if path in protected:
             continue
 
-        partition_start_ms = archive_object_partition_start_ms(path)
+        match = _ARCHIVE_OBJECT_RE.fullmatch(path)
+        if match is None:
+            continue
 
+        partition_start_ms = archive_object_partition_start_ms(path)
         if partition_start_ms is None:
             continue
 
         # Retain any hour which still intersects the configured retention
         # window. Delete only when the complete hour ended at/before cutoff.
-        if partition_start_ms + _HOUR_MS <= cutoff_ms:
-            expired.append((partition_start_ms, path))
+        if partition_start_ms + _HOUR_MS > cutoff_ms:
+            continue
 
-    # Oldest partitions are removed first. Path is the deterministic tie-breaker
-    # between a partition's coverage JSON and Parquet object.
-    expired.sort(key=lambda item: (item[0], item[1]))
+        key = (
+            partition_start_ms,
+            str(match.group("base")),
+        )
+        expired_by_partition.setdefault(key, []).append(path)
 
-    return tuple(
-        path
-        for _partition_start_ms, path in expired[:max_deletions]
-    )
+    planned: list[str] = []
+
+    for key in sorted(expired_by_partition):
+        partition_paths = sorted(set(expired_by_partition[key]))
+
+        has_manifest = any(path.startswith("coverage/") for path in partition_paths)
+        has_parquet = any(path.startswith("market_points/") for path in partition_paths)
+
+        if has_manifest and has_parquet:
+            # A complete partition is one ownership unit. If the remaining
+            # budget cannot hold both objects, stop before splitting the pair.
+            if len(planned) + len(partition_paths) > max_deletions:
+                break
+
+            planned.extend(partition_paths)
+            continue
+
+        # Existing orphan objects may be removed singly. They are already an
+        # incomplete repository pair, so pairwise budgeting cannot restore
+        # atomicity for them.
+        remaining = max_deletions - len(planned)
+        if remaining <= 0:
+            break
+
+        planned.extend(partition_paths[:remaining])
+
+    return tuple(planned)

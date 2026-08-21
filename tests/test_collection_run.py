@@ -437,7 +437,7 @@ def test_second_base_fetch_failure_uploads_nothing(
     assert store.upload_order == []
 
 
-def test_successful_empty_source_response_still_certifies_coverage(
+def test_successful_empty_source_response_records_query_provenance(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -475,7 +475,13 @@ def test_successful_empty_source_response_still_certifies_coverage(
 
     assert prepared.partitions
     assert all(item.partition.row_count == 0 for item in prepared.partitions)
-    assert all(item.manifest.covered_ranges for item in prepared.partitions)
+    assert all(item.manifest.successful_query_ranges for item in prepared.partitions)
+    assert all(
+        item.manifest.market_completeness == "unproven" for item in prepared.partitions
+    )
+
+    assert set(prepared.responses) == {"BTC", "ETH"}
+    assert all(len(segments) == 1 for segments in prepared.responses.values())
 
 
 def test_publication_plan_is_read_only_and_matches_atomic_commit(
@@ -556,3 +562,33 @@ def test_prepare_accepts_explicit_internal_window(
 
     assert prepared.window == window
     assert prepared.partitions
+
+
+def test_oversized_manual_window_is_rejected_before_any_io(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    # 126 complete UTC hours require:
+    #   126 hours × 2 bases × 2 objects = 504 additions.
+    window = CollectionWindow(
+        from_ms=1_786_560_000_000,
+        to_ms=1_786_560_000_000 + 126 * 3_600_000,
+    )
+
+    client = _FakeClient({})
+    store = _MemoryStore(tmp_path)
+
+    with pytest.raises(ValueError, match="before any AGGR or Hugging Face I/O"):
+        prepare_collection_run(
+            settings,
+            client=client,
+            store=store,
+            window=window,
+        )
+
+    assert client.calls == []
+    assert store.revision_calls == 0
+    assert store.download_calls == []
+    assert store.list_calls == []
+    assert store.atomic_calls == []

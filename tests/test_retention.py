@@ -93,10 +93,11 @@ def test_retention_respects_atomic_commit_deletion_budget_oldest_first() -> None
         max_deletions=3,
     )
 
+    # The odd third operation is left unused rather than splitting hour 18's
+    # manifest/Parquet pair.
     assert planned == (
         "coverage/BTC/5000/2026/08/12/17.json",
         "market_points/BTC/5000/2026/08/12/17.parquet",
-        "coverage/BTC/5000/2026/08/12/18.json",
     )
 
 
@@ -108,3 +109,15 @@ def test_retention_zero_deletion_budget_is_valid() -> None:
     )
 
     assert planned == ()
+
+
+def test_retention_can_remove_existing_orphan_with_single_budget() -> None:
+    orphan = "coverage/BTC/5000/2026/08/12/17.json"
+
+    planned = plan_retention_deletions(
+        [orphan],
+        cutoff_ms=_ms(2026, 8, 13, 0),
+        max_deletions=1,
+    )
+
+    assert planned == (orphan,)

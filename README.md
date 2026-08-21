@@ -98,6 +98,27 @@ ETH: BINANCE_FUTURES:ethusdt
 
 Spot and options are not included in the reviewed collector policy.
 
+## Policy eras
+
+Market policies are versioned by exact UTC-hour activation boundaries.
+
+The production registry currently contains only the existing BTC and ETH
+version-1 policies. No synthetic or future policy is active.
+
+When a future reviewed policy is deployed:
+
+- its activation must be an exact UTC-hour boundary;
+- source requests crossing that boundary are split;
+- every hourly partition belongs to exactly one policy;
+- old-policy rows are never merged into a new-policy partition;
+- a partition written under an obsolete policy after the new activation may be
+  replaced from the new-policy query rather than blocking rolling collection;
+- historical pre-boundary partitions remain validated under their original
+  policy identity.
+
+A real future policy must be added independently to both the collector and SMP
+consumer registries. Synthetic policies are test fixtures only.
+
 ## Archive layout
 
 ```text
@@ -108,7 +129,7 @@ coverage/BTC/5000/YYYY/MM/DD/HH.json
 coverage/ETH/5000/YYYY/MM/DD/HH.json
 ```
 
-Each manifest records:
+Each version-2 manifest records:
 
 - hourly partition identity;
 - Parquet path;
@@ -117,11 +138,22 @@ Each manifest records:
 - collector schema version;
 - market policy version;
 - market-list hash;
-- exact selected markets;
+- exact requested markets;
 - Binance execution-price market;
-- certified half-open coverage ranges.
+- `successful_query_ranges`;
+- `market_completeness="unproven"`.
 
-A missing manifest advertises no trusted coverage.
+The reviewed AGGR server does not provide market-level completeness proof.
+Successful query ranges prove only that the storage query completed. They do
+not prove that every requested market was historically configured, collected,
+retained, or returned.
+
+Legacy version-1 manifests remain readable. Their field named
+`covered_ranges` is interpreted conservatively as successful storage-query
+provenance with unproven market completeness. A touched v1 partition is
+rewritten as v2 during ordinary reconciliation.
+
+A missing manifest advertises no successful query provenance.
 
 ## Publication transaction
 
@@ -142,6 +174,20 @@ Each run:
 
 If the repository changed after reconciliation, publication fails. Rerun the
 collector instead of applying the stale plan.
+
+Transient Hugging Face read failures are retried with bounded exponential
+backoff for:
+
+- repository revision discovery;
+- repository file listing;
+- immutable-revision manifest/Parquet downloads;
+- post-commit verification downloads.
+
+Atomic write operations are not blindly retried. A remote commit can succeed
+while its HTTP response times out, so automatic replay could create an
+uncertain duplicate or stale-parent attempt. In that case the run fails closed
+and the next scheduled run reconciles against the repository's actual current
+revision.
 
 ## User-visible inclusive ranges
 
@@ -320,6 +366,10 @@ later scheduled runs continue the bounded cleanup.
 - Missing Binance price buckets remain gaps.
 - A policy-version boundary cannot be silently merged into one homogeneous CVD
   plot.
+- AGGR HTTP success does not prove complete selected-market observation.
+  Empty/no-row buckets are not certified zero activity. Returned rows are
+  observed-row evidence only until a future source/manifest contract can
+  provide market-level completeness proof.
 ```
 
 ---

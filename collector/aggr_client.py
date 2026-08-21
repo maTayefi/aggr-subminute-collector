@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import json
 import time
+import math
 from typing import Any, Iterable
 from urllib.parse import quote
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 
 import httpx
 
@@ -241,15 +245,27 @@ def _timestamp_seconds(
     if isinstance(raw, bool):
         raise ValueError(f"AGGR row {row_number}: time must be numeric, not bool")
 
-    try:
-        numeric = float(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"AGGR row {row_number}: invalid time {raw!r}") from exc
+    if isinstance(raw, int):
+        timestamp = raw
+    elif isinstance(raw, Decimal):
+        if not raw.is_finite() or raw != raw.to_integral_value():
+            raise ValueError(f"AGGR row {row_number}: time must be whole UNIX seconds")
+        timestamp = int(raw)
+    elif isinstance(raw, str):
+        try:
+            numeric = Decimal(raw.strip())
+        except InvalidOperation as exc:
+            raise ValueError(f"AGGR row {row_number}: invalid time {raw!r}") from exc
 
-    if not numeric.is_integer():
-        raise ValueError(f"AGGR row {row_number}: time must be whole UNIX seconds")
+        if not numeric.is_finite() or numeric != numeric.to_integral_value():
+            raise ValueError(f"AGGR row {row_number}: time must be whole UNIX seconds")
 
-    timestamp = int(numeric)
+        timestamp = int(numeric)
+    else:
+        raise ValueError(
+            f"AGGR row {row_number}: time must be an exact integer or "
+            f"decimal string; got {raw!r}"
+        )
     interval_seconds = interval_ms // 1000
 
     if timestamp % interval_seconds != 0:
@@ -458,6 +474,28 @@ def parse_aggr_historical_payload(
             context=context,
         )
 
+        if o is None:
+            ordinary_trade_activity = bool(
+                cbuy > 0 or csell > 0 or vbuy > 0.0 or vsell > 0.0
+            )
+            liquidation_activity = bool(
+                (lbuy is not None and lbuy > 0.0) or (lsell is not None and lsell > 0.0)
+            )
+
+            if ordinary_trade_activity:
+                raise ValueError(
+                    f"{context}: fully null OHLC is permitted only for a "
+                    "liquidation-only bucket with zero ordinary trade count/"
+                    "notional fields"
+                )
+
+            if not liquidation_activity:
+                raise ValueError(
+                    f"{context}: fully null OHLC requires positive liquidation "
+                    "activity; an all-zero/null row is not a canonical market "
+                    "point"
+                )
+
         point = CanonicalMarketPoint(
             ts_utc_seconds=timestamp,
             market=market,
@@ -562,15 +600,13 @@ class AggrHistoricalClient:
                     response = client.get(url)
 
                     if response.status_code == 429:
-                        retry_after_raw = response.headers.get("Retry-After")
-                        try:
-                            retry_after = float(retry_after_raw or 0.0)
-                        except ValueError:
-                            retry_after = 0.0
+                        retry_after = _retry_after_seconds(
+                            response.headers.get("Retry-After")
+                        )
 
                         raise _RetryableAggrError(
                             f"AGGR returned HTTP 429 for {policy.base}",
-                            retry_after_seconds=max(0.0, retry_after),
+                            retry_after_seconds=retry_after,
                         )
 
                     if 500 <= response.status_code <= 599:
@@ -582,7 +618,11 @@ class AggrHistoricalClient:
                     response.raise_for_status()
 
                     try:
-                        payload = response.json()
+                        payload = json.loads(
+                            response.text,
+                            parse_float=Decimal,
+                            parse_int=int,
+                        )
                     except json.JSONDecodeError as exc:
                         raise _RetryableAggrError(
                             f"AGGR returned invalid JSON for {policy.base}"
@@ -611,12 +651,43 @@ class AggrHistoricalClient:
                     if isinstance(exc, _RetryableAggrError):
                         delay = max(delay, exc.retry_after_seconds)
 
-                    time.sleep(min(delay, 30.0))
+                    time.sleep(delay)
 
         raise RuntimeError(
             f"AGGR historical GET failed after {self.max_attempts} attempt(s) "
             f"for base={policy.base}, range=[{from_ms}, {to_ms})"
         ) from last_error
+
+
+def _retry_after_seconds(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+
+    try:
+        numeric = float(text)
+    except ValueError:
+        numeric = None
+
+    if numeric is not None:
+        if not math.isfinite(numeric):
+            return 0.0
+        return max(0.0, numeric)
+
+    try:
+        retry_at = parsedate_to_datetime(text)
+    except TypeError, ValueError, OverflowError:
+        return 0.0
+
+    if retry_at.tzinfo is None or retry_at.utcoffset() is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    else:
+        retry_at = retry_at.astimezone(timezone.utc)
+
+    return max(
+        0.0,
+        (retry_at - datetime.now(tz=timezone.utc)).total_seconds(),
+    )
 
 
 class _RetryableAggrError(RuntimeError):

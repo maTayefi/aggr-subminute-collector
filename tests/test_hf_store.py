@@ -4,12 +4,16 @@ from pathlib import Path
 import shutil
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from huggingface_hub import (
     CommitOperationAdd,
     CommitOperationDelete,
 )
-from huggingface_hub.utils import EntryNotFoundError
+from huggingface_hub.utils import (
+    EntryNotFoundError,
+    LocalEntryNotFoundError,
+)
 from pydantic import SecretStr
 
 from collector.config import CollectorSettings
@@ -241,6 +245,117 @@ def test_missing_remote_object_returns_none(
     )
 
     assert store.download_optional("coverage/BTC/5000/2026/08/12/18.json") is None
+
+
+def test_local_cache_resolution_failure_is_retried_and_not_remote_absence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    remote_root = tmp_path / "remote"
+    remote_root.mkdir()
+
+    calls = 0
+    sleeps: list[float] = []
+
+    def _unavailable_download(**_kwargs):
+        nonlocal calls
+        calls += 1
+
+        raise LocalEntryNotFoundError("synthetic offline/cache-resolution failure")
+
+    monkeypatch.setattr(
+        "collector.hf_store.hf_hub_download",
+        _unavailable_download,
+    )
+    monkeypatch.setattr(
+        "collector.hf_store.time.sleep",
+        lambda value: sleeps.append(float(value)),
+    )
+
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "hf_read_max_attempts": 3,
+            "hf_read_initial_backoff_seconds": 0.25,
+        }
+    )
+
+    store = HuggingFaceArchiveStore(
+        settings,
+        api=_FakeApi(remote_root),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=("failed after 3 attempt.*" "transport/cache-resolution errors"),
+    ):
+        store.download_optional(
+            "coverage/BTC/5000/2026/08/12/18.json",
+        )
+
+    # This condition remains infrastructure failure. It must never become the
+    # ordinary remote-absence result None.
+    assert calls == 3
+    assert sleeps == pytest.approx([0.25, 0.50])
+
+
+def test_download_retries_huggingface_wrapped_read_timeout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    remote_root = tmp_path / "remote"
+    remote_path = "coverage/BTC/5000/2026/08/12/18.json"
+
+    source = remote_root / remote_path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text('{"schema":"test"}', encoding="utf-8")
+
+    calls = 0
+    sleeps: list[float] = []
+
+    def _flaky_download(**_kwargs):
+        nonlocal calls
+        calls += 1
+
+        if calls < 3:
+            try:
+                raise httpx.ReadTimeout("synthetic Hugging Face read timeout")
+            except httpx.ReadTimeout as exc:
+                raise ValueError(
+                    "Force download failed due to the above error."
+                ) from exc
+
+        return str(source)
+
+    monkeypatch.setattr(
+        "collector.hf_store.hf_hub_download",
+        _flaky_download,
+    )
+    monkeypatch.setattr(
+        "collector.hf_store.time.sleep",
+        lambda value: sleeps.append(float(value)),
+    )
+
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "hf_read_max_attempts": 4,
+            "hf_read_initial_backoff_seconds": 0.25,
+        }
+    )
+    store = HuggingFaceArchiveStore(
+        settings,
+        api=_FakeApi(remote_root),
+    )
+
+    downloaded = store.download_optional(
+        remote_path,
+        force_download=True,
+        revision="a" * 40,
+    )
+
+    assert downloaded is not None
+    assert downloaded.local_path.read_bytes() == source.read_bytes()
+    assert calls == 3
+    assert sleeps == pytest.approx([0.25, 0.50])
 
 
 def test_upload_is_verified_by_remote_hash(
@@ -476,3 +591,103 @@ def test_atomic_commit_rejects_empty_operation_set(
         )
 
     assert api.create_commit_calls == []
+
+
+def test_download_timeout_exhaustion_is_infrastructure_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    remote_root = tmp_path / "remote"
+    remote_root.mkdir()
+
+    calls = 0
+
+    def _always_timeout(**_kwargs):
+        nonlocal calls
+        calls += 1
+
+        try:
+            raise httpx.ReadTimeout("synthetic persistent Hugging Face timeout")
+        except httpx.ReadTimeout as exc:
+            raise ValueError("Force download failed due to the above error.") from exc
+
+    monkeypatch.setattr(
+        "collector.hf_store.hf_hub_download",
+        _always_timeout,
+    )
+    monkeypatch.setattr(
+        "collector.hf_store.time.sleep",
+        lambda _value: None,
+    )
+
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "hf_read_max_attempts": 3,
+            "hf_read_initial_backoff_seconds": 0.01,
+        }
+    )
+    store = HuggingFaceArchiveStore(
+        settings,
+        api=_FakeApi(remote_root),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="failed after 3 attempt",
+    ):
+        store.download_optional(
+            "coverage/BTC/5000/2026/08/12/18.json",
+            force_download=True,
+            revision="a" * 40,
+        )
+
+    assert calls == 3
+
+
+def test_current_revision_retries_transient_timeout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    remote_root = tmp_path / "remote"
+    remote_root.mkdir()
+
+    class _FlakyRevisionApi(_FakeApi):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.repo_info_calls = 0
+
+        def repo_info(
+            self,
+            *,
+            repo_id,
+            repo_type,
+            revision,
+            token,
+        ):
+            _ = repo_id, repo_type, revision, token
+            self.repo_info_calls += 1
+
+            if self.repo_info_calls == 1:
+                raise httpx.ReadTimeout("synthetic revision timeout")
+
+            return SimpleNamespace(sha=self.base_revision)
+
+    monkeypatch.setattr(
+        "collector.hf_store.time.sleep",
+        lambda _value: None,
+    )
+
+    api = _FlakyRevisionApi(remote_root)
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "hf_read_max_attempts": 3,
+            "hf_read_initial_backoff_seconds": 0.01,
+        }
+    )
+    store = HuggingFaceArchiveStore(
+        settings,
+        api=api,
+    )
+
+    assert store.current_revision() == api.base_revision
+    assert api.repo_info_calls == 2

@@ -18,10 +18,9 @@ from collector.hf_store import HuggingFaceArchiveStore
 from collector.manifest import CoveredRange
 from collector.retention import plan_retention_deletions
 from collector.market_policy import (
-    BTC_POLICY,
-    ETH_POLICY,
     SOURCE_INTERVAL_MS,
     MarketPolicy,
+    market_policy_segments,
 )
 from collector.models import CanonicalMarketPoint
 from collector.partition import partition_start_ms_for_point
@@ -31,6 +30,8 @@ from collector.reconcile import (
 )
 
 _HOUR_MS = 3_600_000
+_HF_COMMIT_OPERATION_LIMIT = 500
+_ARCHIVE_OBJECTS_PER_HOUR = 4  # BTC+ETH, each with Parquet+manifest
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,11 +45,21 @@ class CollectionWindow:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedPolicyResponse:
+    """One source response owned by one exact market-policy era."""
+
+    policy: MarketPolicy
+    window: CollectionWindow
+    activation_start_ms: int
+    response: AggrHistoricalResponse
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedCollectionRun:
     window: CollectionWindow
     staging_root: Path
     base_revision: str
-    responses: Mapping[str, AggrHistoricalResponse]
+    responses: Mapping[str, tuple[PreparedPolicyResponse, ...]]
     partitions: tuple[ReconciledHourlyPartition, ...]
 
 
@@ -128,6 +139,26 @@ def _intersecting_hour_starts(
     )
 
 
+def _validate_publication_addition_bound(
+    window: CollectionWindow,
+) -> tuple[int, ...]:
+    """Reject a collection window whose additions alone cannot fit one commit."""
+    hour_starts = _intersecting_hour_starts(window)
+    addition_count = len(hour_starts) * _ARCHIVE_OBJECTS_PER_HOUR
+
+    if addition_count > _HF_COMMIT_OPERATION_LIMIT:
+        raise ValueError(
+            "Collection window intersects "
+            f"{len(hour_starts)} UTC hour partition(s), requiring "
+            f"{addition_count} Parquet/manifest additions for BTC+ETH. "
+            f"One Hugging Face commit permits at most "
+            f"{_HF_COMMIT_OPERATION_LIMIT} operations. Split the manual "
+            "collection range before any AGGR or Hugging Face I/O is attempted."
+        )
+
+    return hour_starts
+
+
 def _points_by_hour(
     points: tuple[CanonicalMarketPoint, ...],
 ) -> dict[int, tuple[CanonicalMarketPoint, ...]]:
@@ -202,23 +233,72 @@ def prepare_collection_run(
             "aligned internal [from, to) range"
         )
 
-    policies: tuple[MarketPolicy, ...] = (
-        BTC_POLICY,
-        ETH_POLICY,
-    )
+    bases = ("BTC", "ETH")
 
-    # Fetch and strictly validate both complete source responses before reading
-    # or mutating any remote archive state. In particular, an ETH source failure
-    # must not perform Hugging Face revision discovery or reconciliation.
-    responses: dict[str, AggrHistoricalResponse] = {}
+    # The number of additions is known entirely from the requested UTC-hour
+    # intersections. Reject impossible manual windows before AGGR fetching,
+    # Hugging Face revision discovery, downloads, reconciliation, or local
+    # Parquet generation.
+    hour_starts = _validate_publication_addition_bound(actual_window)
+    _ = hour_starts
 
-    for policy in policies:
-        responses[policy.base] = client.fetch(
-            policy=policy,
+    # Split source requests at every deliberate UTC-hour policy boundary.
+    # This prevents one response and one hourly partition from mixing rows
+    # produced under different requested market universes.
+    responses: dict[str, tuple[PreparedPolicyResponse, ...]] = {}
+
+    for base in bases:
+        prepared_responses: list[PreparedPolicyResponse] = []
+
+        for segment in market_policy_segments(
+            base,
             from_ms=actual_window.from_ms,
             to_ms=actual_window.to_ms,
-            timeframe_ms=SOURCE_INTERVAL_MS,
-        )
+        ):
+            segment_window = CollectionWindow(
+                from_ms=segment.start_ms,
+                to_ms=segment.end_ms,
+            )
+
+            response = client.fetch(
+                policy=segment.policy,
+                from_ms=segment_window.from_ms,
+                to_ms=segment_window.to_ms,
+                timeframe_ms=SOURCE_INTERVAL_MS,
+            )
+
+            if not isinstance(response, AggrHistoricalResponse):
+                raise TypeError(
+                    "AGGR client returned an invalid response object for "
+                    f"{base}: {type(response).__name__}"
+                )
+
+            if int(response.request_from_ms) != int(segment_window.from_ms) or int(
+                response.request_to_ms
+            ) != int(segment_window.to_ms):
+                raise RuntimeError(
+                    f"AGGR response ownership mismatch for {base}: "
+                    f"requested=[{segment_window.from_ms}, "
+                    f"{segment_window.to_ms}), response=["
+                    f"{response.request_from_ms}, "
+                    f"{response.request_to_ms})."
+                )
+
+            prepared_responses.append(
+                PreparedPolicyResponse(
+                    policy=segment.policy,
+                    window=segment_window,
+                    activation_start_ms=segment.activation_start_ms,
+                    response=response,
+                )
+            )
+
+        if not prepared_responses:
+            raise RuntimeError(
+                f"No market-policy request segment was produced for {base}"
+            )
+
+        responses[base] = tuple(prepared_responses)
 
     # Every remote object used for reconciliation must come from one immutable
     # repository snapshot. The same SHA becomes create_commit(parent_commit=...).
@@ -233,31 +313,39 @@ def prepare_collection_run(
     staging_root.mkdir(parents=True, exist_ok=True)
 
     prepared: list[ReconciledHourlyPartition] = []
-    hour_starts = _intersecting_hour_starts(actual_window)
 
     try:
-        for policy in policies:
-            response = responses[policy.base]
-            grouped = _points_by_hour(response.points)
+        for base in bases:
+            for prepared_response in responses[base]:
+                policy = prepared_response.policy
+                segment_window = prepared_response.window
+                response = prepared_response.response
 
-            for partition_start_ms in hour_starts:
-                prepared.append(
-                    reconcile_hourly_partition(
-                        store,
-                        staging_root,
-                        policy=policy,
-                        partition_start_ms=partition_start_ms,
-                        incoming_points=grouped.get(
-                            partition_start_ms,
-                            (),
-                        ),
-                        fetched_covered_ranges=_coverage_for_hour(
-                            actual_window,
-                            partition_start_ms,
-                        ),
-                        remote_revision=base_revision,
+                grouped = _points_by_hour(response.points)
+
+                for partition_start_ms in _intersecting_hour_starts(segment_window):
+                    prepared.append(
+                        reconcile_hourly_partition(
+                            store,
+                            staging_root,
+                            policy=policy,
+                            partition_start_ms=partition_start_ms,
+                            incoming_points=grouped.get(
+                                partition_start_ms,
+                                (),
+                            ),
+                            fetched_covered_ranges=_coverage_for_hour(
+                                segment_window,
+                                partition_start_ms,
+                            ),
+                            remote_revision=base_revision,
+                            allow_policy_era_replacement=(
+                                prepared_response.activation_start_ms > 0
+                                and partition_start_ms
+                                >= prepared_response.activation_start_ms
+                            ),
+                        )
                     )
-                )
 
     except BaseException:
         shutil.rmtree(staging_root, ignore_errors=True)
@@ -316,13 +404,14 @@ def plan_collection_publication(
 
     addition_count = len(additions)
 
-    if addition_count > 500:
+    if addition_count > _HF_COMMIT_OPERATION_LIMIT:
         raise ValueError(
-            "Prepared collection additions alone exceed the 500-operation "
-            "Hugging Face commit limit. Split the manual collection window."
+            "Prepared collection additions alone exceed the "
+            f"{_HF_COMMIT_OPERATION_LIMIT}-operation Hugging Face commit "
+            "limit. Split the manual collection window."
         )
 
-    deletion_budget = 500 - addition_count
+    deletion_budget = _HF_COMMIT_OPERATION_LIMIT - addition_count
 
     deletions = plan_retention_deletions(
         repository_files,
@@ -335,10 +424,11 @@ def plan_collection_publication(
     if operation_count <= 0:
         raise RuntimeError("Prepared collection publication plan is empty")
 
-    if operation_count > 500:
+    if operation_count > _HF_COMMIT_OPERATION_LIMIT:
         raise RuntimeError(
-            "Prepared collection exceeded the 500-operation Hugging Face "
-            "commit limit after bounded retention planning."
+            "Prepared collection exceeded the "
+            f"{_HF_COMMIT_OPERATION_LIMIT}-operation Hugging Face commit "
+            "limit after bounded retention planning."
         )
 
     return PlannedCollectionPublication(

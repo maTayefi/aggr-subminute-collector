@@ -46,6 +46,9 @@ jobs:
       AGGR_COLLECTOR_REQUEST_MAX_ATTEMPTS: "4"
       AGGR_COLLECTOR_REQUEST_INITIAL_BACKOFF_SECONDS: "1"
 
+      AGGR_COLLECTOR_HF_READ_MAX_ATTEMPTS: "4"
+      AGGR_COLLECTOR_HF_READ_INITIAL_BACKOFF_SECONDS: "1"
+
     steps:
       - name: Check out collector code
         uses: actions/checkout@v4
