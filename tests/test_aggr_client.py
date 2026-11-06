@@ -360,3 +360,76 @@ def test_successful_empty_response_accepts_empty_column_map() -> None:
     assert parsed.exact_duplicates_dropped == 0
     assert parsed.request_from_ms == FROM_MS
     assert parsed.request_to_ms == TO_MS
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 503])
+def test_retryable_http_status_honors_retry_after(
+    monkeypatch,
+    status_code: int,
+) -> None:
+    import httpx
+
+    import collector.aggr_client as aggr_client
+
+    sleeps: list[float] = []
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def get(self, url: str) -> httpx.Response:
+            self.calls += 1
+            request = httpx.Request("GET", url)
+
+            if self.calls == 1:
+                return httpx.Response(
+                    status_code,
+                    headers={"Retry-After": "7"},
+                    request=request,
+                )
+
+            return httpx.Response(
+                200,
+                json={
+                    "format": "point",
+                    "columns": {},
+                    "results": [],
+                },
+                request=request,
+            )
+
+    fake = FakeClient()
+
+    monkeypatch.setattr(
+        aggr_client.httpx,
+        "Client",
+        lambda **kwargs: fake,
+    )
+    monkeypatch.setattr(
+        aggr_client.time,
+        "sleep",
+        lambda delay: sleeps.append(float(delay)),
+    )
+
+    client = aggr_client.AggrHistoricalClient(
+        max_attempts=2,
+        initial_backoff_seconds=0.25,
+    )
+
+    start_ms = 1_800_000_000_000
+
+    response = client.fetch(
+        policy=BTC_POLICY,
+        from_ms=start_ms,
+        to_ms=start_ms + 5_000,
+    )
+
+    assert response.points == ()
+    assert fake.calls == 2
+    assert sleeps == pytest.approx([7.0])

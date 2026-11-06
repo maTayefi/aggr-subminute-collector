@@ -13,7 +13,8 @@ pyarrow>=22
 orjson>=3.11
 
 # Remote private Dataset repository
-huggingface_hub>=0.34
+# The collector's transport retry handling targets the HTTPX-based v1 SDK.
+huggingface_hub>=1,<2
 
 # Tests
 pytest>=8.4

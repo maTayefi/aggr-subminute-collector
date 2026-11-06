@@ -10,7 +10,8 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Iterable, Mapping
+from typing import Any
+from collections.abc import Iterable, Mapping
 
 import pyarrow as pa
 import pyarrow.parquet as pq

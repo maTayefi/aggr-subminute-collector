@@ -131,7 +131,7 @@ class CollectorSettings(BaseSettings):
         return output
 
     @model_validator(mode="after")
-    def _validate_collector_contract(self) -> "CollectorSettings":
+    def _validate_collector_contract(self) -> CollectorSettings:
         if self.hf_repo_type != "dataset":
             raise ValueError("hf_repo_type must be 'dataset' for the private archive")
 

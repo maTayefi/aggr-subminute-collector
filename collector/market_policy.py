@@ -29,7 +29,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 import hashlib
 import json
-from typing import Iterable
+from collections.abc import Iterable
 
 MARKET_POLICY_SCHEMA_VERSION = "smp_aggr_market_policy.v1"
 COLLECTOR_SCHEMA_VERSION = "smp_aggr_collector.v1"

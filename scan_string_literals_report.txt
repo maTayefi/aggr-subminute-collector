@@ -1,0 +1,46 @@
+SCAN STRING LITERALS REPORT
+================================================================================
+Generated: 2026-11-06T09:05:14
+Root: C:\aggr-subminute-collector
+AI copy mode: False
+Chars filter: None
+Effective match mode: all non-ASCII characters
+All non-ASCII mode: True
+Context lines: 2
+ASCII-safe report: True
+Escape mode: True
+Backup mode: False
+AST safety check: True
+Literal value check: True
+Include extra invisible/emoji marks: True
+Rewrite f-string text tokens: True
+Rewrite strings inside f-string expressions: True
+Rewrite legacy whole f-string tokens: False
+
+REPORT FORMAT NOTE
+--------------------------------------------------------------------------------
+Context lines are AI-safe. Raw non-ASCII characters are rendered as \uXXXX or \UXXXXXXXX escapes. This prevents AI websites from displaying those characters as empty strings or replacing them.
+
+SUMMARY
+--------------------------------------------------------------------------------
+Files scanned: 23
+Initial files with hits: 0
+Initial total hits: 0
+Initial unique special characters: 0
+Files rewritten: 0
+Total replacements: 0
+Remaining files with hits: 0
+Remaining total hits: 0
+Remaining unique special characters: 0
+
+INITIAL MATCHED CHARACTERS BEFORE REWRITE
+--------------------------------------------------------------------------------
+None
+
+REMAINING SPECIAL CHARACTERS FOUND
+--------------------------------------------------------------------------------
+None
+
+FINDINGS BY FILE
+--------------------------------------------------------------------------------
+No matches found.

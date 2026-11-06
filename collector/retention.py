@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import re
-from typing import Iterable
+from collections.abc import Iterable
 
 from collector.market_policy import SOURCE_INTERVAL_MS
 from collector.hf_store import normalize_repo_path

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
-from typing import Mapping
+from collections.abc import Mapping
 
 from collector.aggr_client import (
     AggrHistoricalClient,

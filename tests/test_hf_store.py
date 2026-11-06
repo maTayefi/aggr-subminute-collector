@@ -691,3 +691,246 @@ def test_current_revision_retries_transient_timeout(
 
     assert store.current_revision() == api.base_revision
     assert api.repo_info_calls == 2
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_hf_read_honors_retry_after_seconds(
+    tmp_path: Path,
+    monkeypatch,
+    wrapped: bool,
+) -> None:
+    from huggingface_hub.utils import HfHubHTTPError
+
+    sleeps: list[float] = []
+    calls = 0
+
+    monkeypatch.setattr(
+        "collector.hf_store.time.sleep",
+        lambda delay: sleeps.append(float(delay)),
+    )
+
+    settings = CollectorSettings(
+        work_dir=tmp_path / "work",
+        hf_token=SecretStr("synthetic-read-token"),
+        hf_read_max_attempts=3,
+        hf_read_initial_backoff_seconds=0.25,
+    )
+    store = HuggingFaceArchiveStore(
+        settings,
+        api=SimpleNamespace(),
+    )
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            response = httpx.Response(
+                429,
+                headers={"Retry-After": "7"},
+                request=httpx.Request(
+                    "GET",
+                    "https://example.invalid/archive",
+                ),
+            )
+            error = HfHubHTTPError(
+                "Synthetic rate limit.",
+                response=response,
+            )
+
+            if wrapped:
+                try:
+                    raise error
+                except HfHubHTTPError as exc:
+                    raise ValueError("Synthetic SDK wrapper.") from exc
+
+            raise error
+
+        return "loaded"
+
+    assert store._retry_hf_read("fixture read", operation) == "loaded"
+    assert calls == 2
+    assert sleeps == pytest.approx([7.0])
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["", "not-a-delay", "nan", "inf", "-10"],
+)
+def test_hf_read_invalid_retry_after_keeps_exponential_backoff(
+    tmp_path: Path,
+    monkeypatch,
+    header: str,
+) -> None:
+    from huggingface_hub.utils import HfHubHTTPError
+
+    sleeps: list[float] = []
+    calls = 0
+
+    monkeypatch.setattr(
+        "collector.hf_store.time.sleep",
+        lambda delay: sleeps.append(float(delay)),
+    )
+
+    settings = CollectorSettings(
+        work_dir=tmp_path / "work",
+        hf_token=SecretStr("synthetic-read-token"),
+        hf_read_max_attempts=3,
+        hf_read_initial_backoff_seconds=0.25,
+    )
+    store = HuggingFaceArchiveStore(
+        settings,
+        api=SimpleNamespace(),
+    )
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            response = httpx.Response(
+                503,
+                headers={"Retry-After": header},
+                request=httpx.Request(
+                    "GET",
+                    "https://example.invalid/archive",
+                ),
+            )
+            raise HfHubHTTPError(
+                "Synthetic service failure.",
+                response=response,
+            )
+
+        return "loaded"
+
+    assert store._retry_hf_read("fixture read", operation) == "loaded"
+    assert calls == 2
+    assert sleeps == pytest.approx([0.25])
+
+
+def test_hf_retry_after_supports_http_date(
+    monkeypatch,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    from huggingface_hub.utils import HfHubHTTPError
+
+    import collector.hf_store as hf_store
+
+    fixed_now = datetime(
+        2026,
+        11,
+        6,
+        12,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+    monkeypatch.setattr(
+        hf_store,
+        "datetime",
+        SimpleNamespace(
+            now=lambda tz: fixed_now.astimezone(tz),
+        ),
+    )
+
+    response = httpx.Response(
+        503,
+        headers={
+            "Retry-After": format_datetime(
+                fixed_now + timedelta(seconds=90),
+                usegmt=True,
+            ),
+        },
+        request=httpx.Request(
+            "GET",
+            "https://example.invalid/archive",
+        ),
+    )
+    error = HfHubHTTPError(
+        "Synthetic service failure.",
+        response=response,
+    )
+
+    assert hf_store._hf_retry_after_seconds(error) == pytest.approx(90.0)
+
+
+def test_hf_retry_after_uses_longest_delay_in_exception_chain() -> None:
+    from huggingface_hub.utils import HfHubHTTPError
+
+    from collector.hf_store import _hf_retry_after_seconds
+
+    request = httpx.Request(
+        "GET",
+        "https://example.invalid/archive",
+    )
+
+    inner = HfHubHTTPError(
+        "Synthetic inner failure.",
+        response=httpx.Response(
+            429,
+            headers={"Retry-After": "19"},
+            request=request,
+        ),
+    )
+    outer = HfHubHTTPError(
+        "Synthetic outer failure.",
+        response=httpx.Response(
+            503,
+            headers={"Retry-After": "3"},
+            request=request,
+        ),
+    )
+    outer.__cause__ = inner
+
+    assert _hf_retry_after_seconds(outer) == pytest.approx(19.0)
+
+
+def test_hf_final_failed_attempt_does_not_sleep_again(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from huggingface_hub.utils import HfHubHTTPError
+
+    sleeps: list[float] = []
+    calls = 0
+
+    monkeypatch.setattr(
+        "collector.hf_store.time.sleep",
+        lambda delay: sleeps.append(float(delay)),
+    )
+
+    settings = CollectorSettings(
+        work_dir=tmp_path / "work",
+        hf_token=SecretStr("synthetic-read-token"),
+        hf_read_max_attempts=2,
+        hf_read_initial_backoff_seconds=0.25,
+    )
+    store = HuggingFaceArchiveStore(
+        settings,
+        api=SimpleNamespace(),
+    )
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+
+        raise HfHubHTTPError(
+            "Synthetic persistent rate limit.",
+            response=httpx.Response(
+                429,
+                headers={"Retry-After": "8"},
+                request=httpx.Request(
+                    "GET",
+                    "https://example.invalid/archive",
+                ),
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="failed after 2 attempt"):
+        store._retry_hf_read("fixture read", operation)
+
+    assert calls == 2
+    assert sleeps == pytest.approx([8.0])

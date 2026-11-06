@@ -21,11 +21,15 @@ available only for isolated tooling and tests.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
+import math
 from pathlib import Path
 import shutil
 import time
-from typing import Callable, Iterable, TypeVar
+from typing import TypeVar
+from collections.abc import Callable, Iterable
 
 import httpx
 from huggingface_hub import (
@@ -77,6 +81,57 @@ def _exception_chain(
         current = current.__context__
 
     return tuple(output)
+
+
+def _hf_retry_after_seconds(exc: BaseException) -> float:
+    """Return the longest valid Retry-After delay in the exception chain.
+
+    HF can wrap a transport/HTTP failure in another exception. Inspect the
+    same bounded exception chain used by the retry classifier.
+
+    Invalid headers do not disable the ordinary exponential backoff.
+    A valid server-requested delay is never shortened by this helper.
+    """
+
+    longest = 0.0
+
+    for item in _exception_chain(exc):
+        response = getattr(item, "response", None)
+
+        if response is None:
+            continue
+
+        text = str(response.headers.get("Retry-After", "")).strip()
+
+        if not text:
+            continue
+
+        try:
+            numeric = float(text)
+        except ValueError:
+            numeric = None
+
+        if numeric is not None:
+            if math.isfinite(numeric):
+                longest = max(longest, numeric, 0.0)
+            continue
+
+        try:
+            retry_at = parsedate_to_datetime(text)
+        except TypeError, ValueError, OverflowError:
+            continue
+
+        if retry_at.tzinfo is None or retry_at.utcoffset() is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+
+        delay = (
+            retry_at.astimezone(timezone.utc) - datetime.now(timezone.utc)
+        ).total_seconds()
+
+        if math.isfinite(delay):
+            longest = max(longest, delay, 0.0)
+
+    return longest
 
 
 def _hf_read_error_is_transient(
@@ -242,7 +297,10 @@ class HuggingFaceArchiveStore:
                 if attempt >= attempts:
                     break
 
-                delay = initial_backoff * (2 ** (attempt - 1))
+                delay = max(
+                    initial_backoff * (2 ** (attempt - 1)),
+                    _hf_retry_after_seconds(exc),
+                )
 
                 time.sleep(delay)
 

@@ -8,7 +8,8 @@ from decimal import Decimal, InvalidOperation
 import json
 import time
 import math
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 from urllib.parse import quote
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
@@ -612,7 +613,10 @@ class AggrHistoricalClient:
                     if 500 <= response.status_code <= 599:
                         raise _RetryableAggrError(
                             f"AGGR returned HTTP {response.status_code} "
-                            f"for {policy.base}"
+                            f"for {policy.base}",
+                            retry_after_seconds=_retry_after_seconds(
+                                response.headers.get("Retry-After")
+                            ),
                         )
 
                     response.raise_for_status()

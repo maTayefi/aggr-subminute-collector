@@ -9,7 +9,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 from collector.market_policy import (
     COLLECTOR_SCHEMA_VERSION,
