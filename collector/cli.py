@@ -163,31 +163,34 @@ def _window_from_args(
 
     safe_frontier = rolling_collection_window(settings).to_ms
 
+    # Retention must be evaluated against the current rolling frontier, not
+    # against the manual window end. A historical manual range that already
+    # lies outside the retention window would be deleted by the next scheduled
+    # run, so reject it before doing any collection work.
+    retention_cutoff_ms = safe_frontier - settings.retention_days * 86_400_000
+    first_hour_end_ms = window.from_ms - (window.from_ms % 3_600_000) + 3_600_000
+    if first_hour_end_ms <= retention_cutoff_ms:
+        cutoff_text = datetime.fromtimestamp(
+            retention_cutoff_ms / 1000,
+            tz=timezone.utc,
+        ).isoformat(timespec="seconds")
+        raise ValueError(
+            "The manual range starts in a UTC hour that retention would "
+            "delete on the next scheduled run. Start at or after the hour "
+            f"containing {cutoff_text}."
+        )
+
     if window.to_ms > safe_frontier:
         safe_text = datetime.fromtimestamp(
             (safe_frontier - SOURCE_INTERVAL_MS) / 1000,
             tz=timezone.utc,
         ).isoformat(timespec="seconds")
+        raise ValueError(
+            "Manual ranges must not reach into the source-finalization lag. "
+            f"End at or before {safe_text} UTC."
+        )
 
-        # Retention deletes a partition once its complete UTC hour ends at or
-        # before (window end - retention_days). The next scheduled run would
-        # delete such an hour again, so publishing it only wastes a commit.
-        retention_cutoff_ms = window.to_ms - settings.retention_days * 86_400_000
-        first_hour_end_ms = window.from_ms - (window.from_ms % 3_600_000) + 3_600_000
-
-        if first_hour_end_ms <= retention_cutoff_ms:
-            cutoff_text = datetime.fromtimestamp(
-                retention_cutoff_ms / 1000,
-                tz=timezone.utc,
-            ).isoformat(timespec="seconds")
-
-            raise ValueError(
-                "The manual range starts in a UTC hour that retention would "
-                "delete on the next scheduled run. Start at or after the hour "
-                f"containing {cutoff_text}."
-            )
-
-        return window
+    return window
 
 
 def _build_client(settings: CollectorSettings) -> AggrHistoricalClient:
