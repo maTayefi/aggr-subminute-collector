@@ -934,3 +934,14 @@ def test_hf_final_failed_attempt_does_not_sleep_again(
 
     assert calls == 2
     assert sleeps == pytest.approx([8.0])
+
+
+def test_sdk_remote_missing_file_is_entry_not_found_for_download_optional() -> None:
+    from huggingface_hub.errors import RemoteEntryNotFoundError
+    from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError
+
+    # download_optional() maps confirmed remote absence to None only through
+    # `except EntryNotFoundError`, and the transient classifier must see it
+    # before the generic HfHubHTTPError branch.
+    assert issubclass(RemoteEntryNotFoundError, EntryNotFoundError)
+    assert issubclass(RemoteEntryNotFoundError, HfHubHTTPError)

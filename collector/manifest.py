@@ -600,9 +600,18 @@ def write_partition_manifest(
         suffix=".tmp",
         dir=target.parent,
     )
+    descriptor_owned = True
 
     try:
-        with os.fdopen(descriptor, "wb") as handle:
+        handle = os.fdopen(descriptor, "wb")
+
+        # From here the file object owns the descriptor and closes it, also
+        # when write/fsync fails inside the with-block. Never os.close() a
+        # descriptor number after ownership transfer: it may already belong
+        # to an unrelated file.
+        descriptor_owned = False
+
+        with handle:
             handle.write(manifest.to_bytes())
             handle.flush()
             os.fsync(handle.fileno())
@@ -610,10 +619,11 @@ def write_partition_manifest(
         os.replace(temp_name, target)
 
     except BaseException:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+        if descriptor_owned:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         Path(temp_name).unlink(missing_ok=True)
         raise
 

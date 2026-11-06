@@ -362,7 +362,7 @@ def test_successful_empty_response_accepts_empty_column_map() -> None:
     assert parsed.request_to_ms == TO_MS
 
 
-@pytest.mark.parametrize("status_code", [429, 500, 503])
+@pytest.mark.parametrize("status_code", [408, 425, 429, 500, 503])
 def test_retryable_http_status_honors_retry_after(
     monkeypatch,
     status_code: int,

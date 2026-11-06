@@ -35,7 +35,6 @@ jobs:
       AGGR_COLLECTOR_HF_REPO_ID: maTayefi/smp-aggr-subminute
       AGGR_COLLECTOR_HF_REPO_TYPE: dataset
       AGGR_COLLECTOR_HF_REVISION: main
-      AGGR_COLLECTOR_HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       AGGR_COLLECTOR_WORK_DIR: .collector_work
       AGGR_COLLECTOR_ROLLING_REFETCH_HOURS: "3"
@@ -78,4 +77,6 @@ jobs:
           fi
 
       - name: Run collector
+        env:
+          AGGR_COLLECTOR_HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python -m collector "${{ steps.mode.outputs.value }}"

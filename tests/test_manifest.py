@@ -264,3 +264,53 @@ def test_v2_reader_rejects_legacy_covered_ranges_field(
             policy=BTC_POLICY,
             partition_start_ms=PARTITION_START_MS,
         )
+
+
+def test_manifest_replace_failure_does_not_reclose_transferred_descriptor(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import os as real_os
+
+    import collector.manifest as manifest_module
+
+    partition = write_hourly_partition(
+        tmp_path,
+        policy=BTC_POLICY,
+        partition_start_ms=PARTITION_START_MS,
+        points=[_point()],
+    )
+    manifest = build_partition_manifest(
+        partition,
+        policy=BTC_POLICY,
+        covered_ranges=[
+            CoveredRange(PARTITION_START_MS, PARTITION_START_MS + 3_600_000)
+        ],
+    )
+
+    class _OsProxy:
+        def __init__(self) -> None:
+            self.close_calls: list[int] = []
+
+        def __getattr__(self, name: str):
+            return getattr(real_os, name)
+
+        def replace(self, *args, **kwargs):
+            raise OSError("synthetic replace failure")
+
+        def close(self, descriptor: int) -> None:
+            self.close_calls.append(descriptor)
+            real_os.close(descriptor)
+
+    proxy = _OsProxy()
+    monkeypatch.setattr(manifest_module, "os", proxy)
+
+    with pytest.raises(OSError, match="synthetic replace failure"):
+        write_partition_manifest(tmp_path, manifest)
+
+    # The file object already closed the descriptor; it must not be reused.
+    assert proxy.close_calls == []
+
+    target = tmp_path / partition_manifest_path("BTC", PARTITION_START_MS)
+    assert not target.exists()
+    assert list(target.parent.glob("*.tmp")) == []

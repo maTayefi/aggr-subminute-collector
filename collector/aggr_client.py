@@ -31,6 +31,10 @@ from collector.models import (
 
 AGGR_HISTORICAL_BASE_URL = "https://api.aggr.trade/historical"
 
+# 429 and 5xx are handled separately. Keep this aligned with the desktop
+# consumer (di_profile/aggr_price.py) and collector/hf_store.py.
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425})
+
 _REQUIRED_COLUMNS = {
     "time",
     "cbuy",
@@ -610,7 +614,10 @@ class AggrHistoricalClient:
                             retry_after_seconds=retry_after,
                         )
 
-                    if 500 <= response.status_code <= 599:
+                    if (
+                        response.status_code in _RETRYABLE_HTTP_STATUS_CODES
+                        or 500 <= response.status_code <= 599
+                    ):
                         raise _RetryableAggrError(
                             f"AGGR returned HTTP {response.status_code} "
                             f"for {policy.base}",

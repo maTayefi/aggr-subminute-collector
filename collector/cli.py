@@ -169,12 +169,25 @@ def _window_from_args(
             tz=timezone.utc,
         ).isoformat(timespec="seconds")
 
-        raise ValueError(
-            "The inclusive manual end reaches unfinalized AGGR data. "
-            f"Latest allowed inclusive bucket is currently {safe_text}"
-        )
+        # Retention deletes a partition once its complete UTC hour ends at or
+        # before (window end - retention_days). The next scheduled run would
+        # delete such an hour again, so publishing it only wastes a commit.
+        retention_cutoff_ms = window.to_ms - settings.retention_days * 86_400_000
+        first_hour_end_ms = window.from_ms - (window.from_ms % 3_600_000) + 3_600_000
 
-    return window
+        if first_hour_end_ms <= retention_cutoff_ms:
+            cutoff_text = datetime.fromtimestamp(
+                retention_cutoff_ms / 1000,
+                tz=timezone.utc,
+            ).isoformat(timespec="seconds")
+
+            raise ValueError(
+                "The manual range starts in a UTC hour that retention would "
+                "delete on the next scheduled run. Start at or after the hour "
+                f"containing {cutoff_text}."
+            )
+
+        return window
 
 
 def _build_client(settings: CollectorSettings) -> AggrHistoricalClient:
