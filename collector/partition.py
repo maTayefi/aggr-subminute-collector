@@ -474,8 +474,15 @@ def _atomic_parquet_write(
 
         os.replace(temp_path, path)
 
-    except BaseException:
-        temp_path.unlink(missing_ok=True)
+    except BaseException as exc:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            exc.add_note(
+                "Could not remove unpublished Parquet temporary "
+                f"file {temp_path}: {cleanup_error}"
+            )
+
         raise
 
 

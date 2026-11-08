@@ -1,6 +1,6 @@
 SCAN STRING LITERALS REPORT
 ================================================================================
-Generated: 2026-11-08T19:34:17
+Generated: 2026-11-08T20:05:02
 Root: C:\aggr-subminute-collector
 AI copy mode: False
 Chars filter: None
@@ -23,7 +23,7 @@ Context lines are AI-safe. Raw non-ASCII characters are rendered as \uXXXX or \U
 
 SUMMARY
 --------------------------------------------------------------------------------
-Files scanned: 23
+Files scanned: 24
 Initial files with hits: 0
 Initial total hits: 0
 Initial unique special characters: 0

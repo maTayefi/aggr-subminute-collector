@@ -618,13 +618,24 @@ def write_partition_manifest(
 
         os.replace(temp_name, target)
 
-    except BaseException:
+    except BaseException as exc:
         if descriptor_owned:
             try:
                 os.close(descriptor)
-            except OSError:
-                pass
-        Path(temp_name).unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                exc.add_note(
+                    "Could not close the unpublished manifest temporary "
+                    f"file descriptor: {cleanup_error}"
+                )
+
+        try:
+            Path(temp_name).unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            exc.add_note(
+                "Could not remove unpublished manifest temporary "
+                f"file {temp_name}: {cleanup_error}"
+            )
+
         raise
 
     return target
