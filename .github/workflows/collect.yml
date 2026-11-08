@@ -2,8 +2,9 @@ name: Collect AGGR five-second archive
 
 on:
   schedule:
-    # Avoid the busiest top-of-hour scheduling period.
-    - cron: "17 * * * *"
+    # Every 15 minutes, offset from the busiest top-of-hour slot.
+    # Fires at :07, :22, :37, :52 UTC.
+    - cron: "7-59/15 * * * *"
 
   workflow_dispatch:
     inputs:
@@ -37,7 +38,7 @@ jobs:
       AGGR_COLLECTOR_HF_REVISION: main
 
       AGGR_COLLECTOR_WORK_DIR: .collector_work
-      AGGR_COLLECTOR_ROLLING_REFETCH_HOURS: "3"
+      AGGR_COLLECTOR_ROLLING_REFETCH_HOURS: "8"
       AGGR_COLLECTOR_RETENTION_DAYS: "90"
       AGGR_COLLECTOR_SOURCE_FINALIZATION_LAG_SECONDS: "60"
 
