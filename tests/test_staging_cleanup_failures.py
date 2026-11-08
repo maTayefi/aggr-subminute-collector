@@ -107,3 +107,97 @@ def test_manifest_cleanup_failure_preserves_primary_exception(
         "synthetic manifest cleanup failure" in note
         for note in getattr(primary, "__notes__", ())
     )
+
+
+@pytest.mark.parametrize(
+    "cleanup_fails",
+    [False, True],
+)
+def test_parquet_initial_close_failure_reaches_temporary_cleanup(
+    tmp_path: Path,
+    cleanup_fails: bool,
+) -> None:
+    import os
+    import tempfile
+
+    target = tmp_path / "hour.parquet"
+    original_bytes = b"existing staging object"
+    target.write_bytes(original_bytes)
+
+    primary = OSError("Parquet initial close failed")
+    cleanup_error = PermissionError("Parquet initial-close temporary cleanup failed")
+
+    real_close = os.close
+    real_mkstemp = tempfile.mkstemp
+    real_unlink = Path.unlink
+
+    created_paths: list[Path] = []
+    close_calls: list[int] = []
+    cleanup_calls: list[Path] = []
+
+    def record_mkstemp(*args, **kwargs):
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        created_paths.append(Path(name))
+        return descriptor, name
+
+    def close_then_report_failure(descriptor: int) -> None:
+        close_calls.append(descriptor)
+
+        # Release the real descriptor before reporting the synthetic
+        # close error. Retrying this descriptor number would be unsafe.
+        real_close(descriptor)
+        raise primary
+
+    def unlink(path: Path, *args, **kwargs):
+        if path in created_paths and kwargs.get("missing_ok") is True:
+            cleanup_calls.append(path)
+
+            if cleanup_fails:
+                raise cleanup_error
+
+        return real_unlink(path, *args, **kwargs)
+
+    with (
+        mock.patch(
+            "collector.partition.tempfile.mkstemp",
+            side_effect=record_mkstemp,
+        ),
+        mock.patch(
+            "collector.partition.os.close",
+            side_effect=close_then_report_failure,
+        ),
+        mock.patch.object(
+            Path,
+            "unlink",
+            new=unlink,
+        ),
+        mock.patch(
+            "collector.partition.pq.write_table",
+        ) as write_table,
+        mock.patch(
+            "collector.partition.os.replace",
+        ) as replace_file,
+    ):
+        with pytest.raises(OSError) as caught:
+            _atomic_parquet_write(
+                target,
+                pa.table({"value": [1]}),
+            )
+
+    assert caught.value is primary
+    assert len(created_paths) == 1
+    assert len(close_calls) == 1
+    assert cleanup_calls == created_paths
+
+    write_table.assert_not_called()
+    replace_file.assert_not_called()
+
+    assert target.read_bytes() == original_bytes
+
+    if cleanup_fails:
+        assert created_paths[0].is_file()
+        assert any(
+            str(cleanup_error) in note for note in getattr(primary, "__notes__", ())
+        )
+    else:
+        assert not created_paths[0].exists()

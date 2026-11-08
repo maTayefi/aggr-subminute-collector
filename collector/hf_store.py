@@ -397,8 +397,15 @@ class HuggingFaceArchiveStore:
         try:
             shutil.copyfile(cached_path, temp_path)
             temp_path.replace(local_path)
-        except BaseException:
-            temp_path.unlink(missing_ok=True)
+        except BaseException as exc:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                exc.add_note(
+                    "Could not remove unpublished download temporary "
+                    f"file {temp_path}: {cleanup_error}"
+                )
+
             raise
 
         return RemoteObject(

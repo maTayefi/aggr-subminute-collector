@@ -945,3 +945,158 @@ def test_sdk_remote_missing_file_is_entry_not_found_for_download_optional() -> N
     # before the generic HfHubHTTPError branch.
     assert issubclass(RemoteEntryNotFoundError, EntryNotFoundError)
     assert issubclass(RemoteEntryNotFoundError, HfHubHTTPError)
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["copy", "replace"],
+)
+@pytest.mark.parametrize(
+    "exception_type",
+    [OSError, KeyboardInterrupt, SystemExit],
+)
+@pytest.mark.parametrize(
+    "cleanup_fails",
+    [False, True],
+)
+def test_local_download_staging_preserves_primary_failure_and_can_retry(
+    tmp_path: Path,
+    failure_stage: str,
+    exception_type: type[BaseException],
+    cleanup_fails: bool,
+) -> None:
+    from unittest import mock
+
+    settings = CollectorSettings(
+        _env_file=None,
+        hf_token=SecretStr("test-token"),
+        work_dir=tmp_path / "work",
+    )
+    api = mock.Mock()
+    store = HuggingFaceArchiveStore(
+        settings,
+        api=api,
+    )
+
+    cached_path = tmp_path / "cached-object.bin"
+    cached_bytes = b"verified immutable cached object"
+    cached_path.write_bytes(cached_bytes)
+
+    remote_path = "objects/hour.parquet"
+    revision = "a" * 40
+
+    local_path = store.download_dir / remote_path
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_local_bytes = b"previous collector-local object"
+    local_path.write_bytes(original_local_bytes)
+
+    temp_path = local_path.with_name(f".{local_path.name}.download.tmp")
+
+    primary = exception_type(f"synthetic local download {failure_stage} failure")
+    cleanup_error = PermissionError("synthetic download temporary cleanup failure")
+
+    real_copyfile = shutil.copyfile
+    real_unlink = Path.unlink
+
+    unlink_calls: list[Path] = []
+
+    def copyfile(source, destination):
+        if failure_stage == "copy":
+            # Leave a real partial staging object so cleanup has
+            # meaningful filesystem state to remove.
+            Path(destination).write_bytes(b"partial download copy")
+            raise primary
+
+        return real_copyfile(source, destination)
+
+    def unlink(path: Path, *args, **kwargs):
+        if path == temp_path:
+            unlink_calls.append(path)
+
+            # The first unlink removes any old deterministic temporary
+            # path before staging begins. The second is failure cleanup.
+            if len(unlink_calls) == 2 and cleanup_fails:
+                raise cleanup_error
+
+        return real_unlink(path, *args, **kwargs)
+
+    with mock.patch.object(
+        store,
+        "_download_from_hub",
+        return_value=cached_path,
+    ) as download:
+        with (
+            mock.patch(
+                "collector.hf_store.shutil.copyfile",
+                side_effect=copyfile,
+            ) as copy,
+            mock.patch.object(
+                Path,
+                "replace",
+                side_effect=primary,
+            ) as replace_file,
+            mock.patch.object(
+                Path,
+                "unlink",
+                new=unlink,
+            ),
+        ):
+            with pytest.raises(exception_type) as caught:
+                store.download_optional(
+                    remote_path,
+                    revision=revision,
+                )
+
+        assert caught.value is primary
+
+        copy.assert_called_once_with(
+            cached_path,
+            temp_path,
+        )
+
+        if failure_stage == "copy":
+            replace_file.assert_not_called()
+        else:
+            replace_file.assert_called_once_with(local_path)
+
+        assert unlink_calls == [temp_path, temp_path]
+        assert local_path.read_bytes() == original_local_bytes
+        assert cached_path.read_bytes() == cached_bytes
+
+        if cleanup_fails:
+            assert temp_path.is_file()
+            assert any(
+                str(cleanup_error) in note for note in getattr(primary, "__notes__", ())
+            )
+        else:
+            assert not temp_path.exists()
+
+        # Retry with healthy local I/O. This also verifies that an
+        # abandoned deterministic temporary file from failed cleanup
+        # is removed before the next staging attempt.
+        recovered = store.download_optional(
+            remote_path,
+            revision=revision,
+        )
+
+    assert recovered is not None
+    assert recovered.path_in_repo == remote_path
+    assert recovered.local_path == local_path
+    assert recovered.local_path.read_bytes() == cached_bytes
+    assert recovered.size_bytes == len(cached_bytes)
+    assert recovered.sha256 == sha256_file(cached_path)
+
+    assert cached_path.read_bytes() == cached_bytes
+    assert not temp_path.exists()
+
+    assert download.call_count == 2
+    download.assert_called_with(
+        remote_path,
+        force_download=True,
+        revision=revision,
+    )
+
+    # These tests exercise local staging only. No remote API mutation
+    # or repository discovery should be needed.
+    assert api.mock_calls == []

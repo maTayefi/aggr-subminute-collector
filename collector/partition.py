@@ -448,10 +448,14 @@ def _atomic_parquet_write(
         suffix=".tmp",
         dir=path.parent,
     )
-    os.close(descriptor)
     temp_path = Path(temp_name)
 
     try:
+        # Keep initial-close failures inside the cleanup boundary.
+        # A failed close must not be retried using the same descriptor
+        # number because it may already have been released and reused.
+        os.close(descriptor)
+
         pq.write_table(
             table,
             temp_path,
