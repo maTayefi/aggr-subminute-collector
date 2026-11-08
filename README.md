@@ -8,7 +8,7 @@ Money Profile application.
 ```text
 GitHub Actions
     |
-    | hourly GET requests
+    | GET requests every 30 minutes, subject to scheduler delays
     v
 api.aggr.trade/historical
     |
@@ -315,10 +315,18 @@ Do not place the token in:
 - test fixtures;
 - screenshots.
 
-The workflow runs hourly at minute 17 and supports manual dispatch.
+The workflow is scheduled every 30 minutes at minutes 7 and 37 UTC and
+supports manual dispatch. Actual start times can be delayed.
 
-Scheduled and manual runs share one concurrency group. Active runs are queued,
-not cancelled.
+Each normal run re-reads the configured 7-hour rolling source window,
+ending at the finalized five-second frontier. This provides overlap for
+recovery and upstream reconciliation; it is not a guarantee that every
+requested observation remains available upstream.
+
+Scheduled and manual runs share one concurrency group. A new run does not
+cancel the active publisher. Pending runs are subject to GitHub Actions
+concurrency and scheduling behavior; do not treat the schedule as a durable
+queue of every requested execution.
 
 ## First production run
 
@@ -356,7 +364,14 @@ later scheduled runs continue the bounded cleanup.
 
 ## Limitations
 
-- GitHub Actions scheduling is not real-time and can start late.
+- GitHub Actions scheduling is not real-time. Scheduled runs can start late
+  or be dropped. The workflow is scheduled every 30 minutes, and each normal
+  successful run re-reads a 7-hour source window. This reduces exposure to
+  missed executions but does not guarantee complete five-second history.
+- Recovery requires a successful fetch before the needed source observations
+  expire. The 7-hour window, source-finalization lag, request execution time,
+  upstream outages, and changing AGGR retention all affect recoverability.
+  Already-expired observations cannot be reconstructed by a later collector run.
 - A source outage longer than aggr.trade's five-second history window can create
   unrecoverable gaps.
 - Free GitHub/Hugging Face policies and quotas can change.

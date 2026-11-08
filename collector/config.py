@@ -40,7 +40,7 @@ class CollectorSettings(BaseSettings):
 
     work_dir: Path = Path(".collector_work")
 
-    rolling_refetch_hours: int = 3
+    rolling_refetch_hours: int = 7
     retention_days: int = 90
 
     # aggr-server can append in-memory pending bars when the request reaches

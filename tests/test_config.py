@@ -123,3 +123,19 @@ def test_hf_read_retry_configuration_accepts_environment_style_strings() -> None
 
     assert settings.hf_read_max_attempts == 3
     assert settings.hf_read_initial_backoff_seconds == pytest.approx(0.25)
+
+
+def test_default_rolling_refetch_window_is_seven_hours(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "AGGR_COLLECTOR_ROLLING_REFETCH_HOURS",
+        raising=False,
+    )
+
+    settings = CollectorSettings(
+        _env_file=None,
+        hf_token=SecretStr("test-token"),
+    )
+
+    assert settings.rolling_refetch_hours == 7

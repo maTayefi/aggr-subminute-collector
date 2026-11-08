@@ -1,6 +1,6 @@
 SCAN STRING LITERALS REPORT
 ================================================================================
-Generated: 2026-11-06T09:05:14
+Generated: 2026-11-08T19:34:17
 Root: C:\aggr-subminute-collector
 AI copy mode: False
 Chars filter: None

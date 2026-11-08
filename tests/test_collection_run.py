@@ -592,3 +592,52 @@ def test_oversized_manual_window_is_rejected_before_any_io(
     assert store.download_calls == []
     assert store.list_calls == []
     assert store.atomic_calls == []
+
+
+@pytest.mark.parametrize(
+    ("minute", "second", "expected_hour_count"),
+    [
+        (1, 0, 7),
+        (34, 47, 8),
+    ],
+)
+def test_seven_hour_window_has_expected_partition_addition_bound(
+    tmp_path: Path,
+    minute: int,
+    second: int,
+    expected_hour_count: int,
+) -> None:
+    from collector.run import _validate_publication_addition_bound
+
+    settings = CollectorSettings(
+        _env_file=None,
+        hf_token=SecretStr("test-token"),
+        work_dir=tmp_path / "work",
+        rolling_refetch_hours=7,
+        source_finalization_lag_seconds=60,
+    )
+    now = datetime(
+        2026,
+        8,
+        13,
+        12,
+        minute,
+        second,
+        tzinfo=timezone.utc,
+    )
+
+    window = rolling_collection_window(
+        settings,
+        now_utc=now,
+    )
+    hours = _validate_publication_addition_bound(window)
+
+    assert window.to_ms - window.from_ms == 7 * 3_600_000
+    assert window.from_ms % SOURCE_INTERVAL_MS == 0
+    assert window.to_ms % SOURCE_INTERVAL_MS == 0
+    assert len(hours) == expected_hour_count
+
+    # BTC + ETH, with one Parquet object and one manifest per UTC hour.
+    addition_count = len(hours) * 4
+    assert addition_count in {28, 32}
+    assert addition_count <= 500
