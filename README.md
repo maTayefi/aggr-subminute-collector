@@ -385,6 +385,13 @@ later scheduled runs continue the bounded cleanup.
   Empty/no-row buckets are not certified zero activity. Returned rows are
   observed-row evidence only until a future source/manifest contract can
   provide market-level completeness proof.
+  
+## Resource usage
+- Personal, non-commercial research archive.
+- Runs every 2 hours via GitHub Actions (~12 short runs/day, a few minutes each).
+- Data is stored in a private Hugging Face dataset, not in this repository.
+- The collector honors upstream Retry-After and uses bounded retries.
+
 ```
 
 ---

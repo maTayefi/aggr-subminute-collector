@@ -4,7 +4,7 @@ on:
   schedule:
     # Every 30 minutes, offset from the busiest scheduling slots.
     # Fires at :07 and :37 UTC; actual starts can be delayed.
-    - cron: "7,37 * * * *"
+    - cron: "7 */2 * * *"
 
   workflow_dispatch:
     inputs:
