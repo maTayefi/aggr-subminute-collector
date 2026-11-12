@@ -641,3 +641,188 @@ def test_seven_hour_window_has_expected_partition_addition_bound(
     addition_count = len(hours) * 4
     assert addition_count in {28, 32}
     assert addition_count <= 500
+
+
+def _seed_reconciliation_integrity_source(
+    store,
+    *,
+    partition_start_ms: int,
+    points,
+    covered_ranges,
+    duplicate_physical_rows: bool = False,
+    declared_row_count: int | None = None,
+) -> None:
+    from dataclasses import replace
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from collector.hf_store import sha256_file
+    from collector.manifest import (
+        build_partition_manifest,
+        write_partition_manifest,
+    )
+    from collector.partition import write_hourly_partition
+
+    partition = write_hourly_partition(
+        store.remote_root,
+        policy=BTC_POLICY,
+        partition_start_ms=partition_start_ms,
+        points=points,
+    )
+    manifest = build_partition_manifest(
+        partition,
+        policy=BTC_POLICY,
+        covered_ranges=covered_ranges,
+    )
+
+    if duplicate_physical_rows:
+        table = pq.read_table(partition.local_path)
+        pq.write_table(
+            pa.concat_tables([table, table]),
+            partition.local_path,
+        )
+        manifest = replace(
+            manifest,
+            data_sha256=sha256_file(partition.local_path),
+            row_count=(
+                table.num_rows * 2
+                if declared_row_count is None
+                else declared_row_count
+            ),
+        )
+    elif declared_row_count is not None:
+        manifest = replace(
+            manifest,
+            row_count=declared_row_count,
+        )
+
+    write_partition_manifest(
+        store.remote_root,
+        manifest,
+    )
+
+
+@pytest.mark.parametrize("refetched", [False, True])
+def test_reconciliation_does_not_promote_old_untrusted_rows(
+    tmp_path: Path,
+    refetched: bool,
+) -> None:
+    from dataclasses import replace
+
+    from collector.manifest import CoveredRange
+    from collector.reconcile import reconcile_hourly_partition
+
+    hour_ms = 1_800_000_000_000
+    first_s = hour_ms // 1000
+    store = _MemoryStore(tmp_path)
+
+    trusted = _point(BTC_POLICY, first_s)
+    old_untrusted = _point(BTC_POLICY, first_s + 10)
+    fresh = replace(
+        old_untrusted,
+        vbuy=old_untrusted.vbuy + 123.0,
+    )
+
+    _seed_reconciliation_integrity_source(
+        store,
+        partition_start_ms=hour_ms,
+        points=(trusted, old_untrusted),
+        covered_ranges=(CoveredRange(hour_ms, hour_ms + 5_000),),
+    )
+
+    result = reconcile_hourly_partition(
+        store,
+        tmp_path / "reconciled",
+        policy=BTC_POLICY,
+        partition_start_ms=hour_ms,
+        incoming_points=(fresh,) if refetched else (),
+        fetched_covered_ranges=(
+            CoveredRange(hour_ms + 10_000, hour_ms + 15_000),
+        ),
+        remote_revision=store.BASE_REVISION,
+    )
+
+    by_key = {point.key: point for point in result.partition.points}
+    assert by_key[trusted.key] == trusted
+
+    if refetched:
+        assert by_key[fresh.key] == fresh
+        assert by_key[fresh.key].vbuy != old_untrusted.vbuy
+    else:
+        assert old_untrusted.key not in by_key
+
+    assert any(
+        covered.start_ms <= hour_ms + 10_000 < covered.end_ms
+        for covered in result.manifest.successful_query_ranges
+    )
+
+
+def test_reconciliation_accepts_correct_physical_duplicate_row_count(
+    tmp_path: Path,
+) -> None:
+    from collector.manifest import CoveredRange
+    from collector.reconcile import reconcile_hourly_partition
+
+    hour_ms = 1_800_000_000_000
+    first_s = hour_ms // 1000
+    store = _MemoryStore(tmp_path)
+    point = _point(BTC_POLICY, first_s)
+
+    _seed_reconciliation_integrity_source(
+        store,
+        partition_start_ms=hour_ms,
+        points=(point,),
+        covered_ranges=(CoveredRange(hour_ms, hour_ms + 5_000),),
+        duplicate_physical_rows=True,
+        declared_row_count=2,
+    )
+
+    result = reconcile_hourly_partition(
+        store,
+        tmp_path / "reconciled",
+        policy=BTC_POLICY,
+        partition_start_ms=hour_ms,
+        incoming_points=(),
+        fetched_covered_ranges=(
+            CoveredRange(hour_ms, hour_ms + 5_000),
+        ),
+        remote_revision=store.BASE_REVISION,
+    )
+
+    assert result.partition.points == (point,)
+    assert result.partition.row_count == 1
+    assert result.manifest.row_count == 1
+
+
+def test_reconciliation_rejects_incorrect_physical_duplicate_row_count(
+    tmp_path: Path,
+) -> None:
+    from collector.manifest import CoveredRange
+    from collector.reconcile import reconcile_hourly_partition
+
+    hour_ms = 1_800_000_000_000
+    first_s = hour_ms // 1000
+    store = _MemoryStore(tmp_path)
+
+    _seed_reconciliation_integrity_source(
+        store,
+        partition_start_ms=hour_ms,
+        points=(_point(BTC_POLICY, first_s),),
+        covered_ranges=(CoveredRange(hour_ms, hour_ms + 5_000),),
+        duplicate_physical_rows=True,
+        declared_row_count=1,
+    )
+
+    with pytest.raises(ValueError, match="row_count mismatch"):
+        reconcile_hourly_partition(
+            store,
+            tmp_path / "reconciled",
+            policy=BTC_POLICY,
+            partition_start_ms=hour_ms,
+            incoming_points=(),
+            fetched_covered_ranges=(
+                CoveredRange(hour_ms, hour_ms + 5_000),
+            ),
+            remote_revision=store.BASE_REVISION,
+        )

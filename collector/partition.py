@@ -647,10 +647,19 @@ def read_hourly_partition(
     *,
     policy: MarketPolicy,
     partition_start_ms: int,
+    expected_row_count: int | None = None,
 ) -> tuple[CanonicalMarketPoint, ...]:
-    """Read and strictly validate one collector-owned hourly partition."""
+    """Validate physical rows, then return canonical unique market points."""
 
     start_ms = _hour_start_ms(partition_start_ms)
+
+    if expected_row_count is not None:
+        if (
+            isinstance(expected_row_count, bool)
+            or not isinstance(expected_row_count, int)
+            or expected_row_count < 0
+        ):
+            raise ValueError("expected_row_count must be a nonnegative integer")
 
     try:
         table = pq.read_table(path)
@@ -660,6 +669,12 @@ def read_hourly_partition(
     if not table.schema.equals(PARQUET_SCHEMA, check_metadata=True):
         raise ValueError(
             f"Parquet schema mismatch for {path}; expected " f"{PARQUET_SCHEMA_VERSION}"
+        )
+
+    if expected_row_count is not None and table.num_rows != expected_row_count:
+        raise ValueError(
+            f"Parquet row_count mismatch for {path}: "
+            f"manifest={expected_row_count}, parquet={table.num_rows}"
         )
 
     points = tuple(

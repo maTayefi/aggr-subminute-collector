@@ -113,17 +113,25 @@ def _load_existing_remote_partition(
         data_object.local_path,
         policy=policy,
         partition_start_ms=partition_start_ms,
+        expected_row_count=manifest.row_count,
     )
 
-    if len(existing_points) != manifest.row_count:
-        raise RuntimeError(
-            f"Existing remote row_count mismatch for "
-            f"{manifest.data_file!r}: manifest={manifest.row_count}, "
-            f"parquet={len(existing_points)}"
+    # Existing rows are trusted only under the provenance of the
+    # existing immutable manifest. A later successful sparse or empty
+    # refetch must not retroactively authenticate an older row.
+    trusted_existing_points = tuple(
+        point
+        for point in existing_points
+        if any(
+            covered.start_ms
+            <= point.ts_utc_seconds * 1000
+            < covered.end_ms
+            for covered in manifest.successful_query_ranges
         )
+    )
 
     return (
-        existing_points,
+        trusted_existing_points,
         manifest.covered_ranges,
         manifest,
         False,
